@@ -1,5 +1,10 @@
 # usage
-syncLauper를 위한 키 동글 생성 프로그램
+[syncLaupe](https://github.com/icq4ever/syncLauper)를 위한 라이센스 USB 동글 생성 프로그램
+- 앱에는 `pubkey.pem`이 들어있다.
+- `pubkey.pem`과 쌍인 `privkey.pem`를 이용해 , 라이센스 정보 `license.json`과 함께 `signature.sig`를 생성하여 USB에 배포한다.
+- 자동 마운트를 위해 디스크 라벨은 `SL-DONGLE`이 되어야 한다.
+- partition은 `fat32`, `ext4`를 지원한다.
+- usb 디스크에 `READMME.pdf`를 넣을 수 있다. (옵션)
 
 ## IMPORTANT
 - 라벨이 `SL-DONGLE` 일 경우, 리눅스에서 자동으로 `/media/dongle` 에 읽기 전용으로 마운트되도록 `/etc/fstab` 에 아래와 같이 작성한다
