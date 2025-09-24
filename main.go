@@ -1,4 +1,4 @@
-// main.go — Ed25519 only, hardened binding, RO mount + DOS R-attr
+// main.go — Ed25519 only, hardened binding, mattrib(-i ::/path) + chmod fallback, RO remount
 package main
 
 import (
@@ -27,7 +27,7 @@ const (
 	privPathFix   = "privkey.pem"    // Ed25519 개인키 고정 경로 (PKCS#8)
 )
 
-/* ===== Public JSON schema (device/binding 미노출) ===== */
+/* ===== 공개 JSON 스키마 (device/binding 미노출) ===== */
 type License struct {
 	Version     int        `json:"version"`
 	Licensee    string     `json:"licensee"`
@@ -38,14 +38,12 @@ type License struct {
 	Note        string     `json:"note,omitempty"`
 }
 
-/* ===== Internal (노출 금지) ===== */
+/* ===== 내부 전용 (노출 금지) ===== */
 type DeviceSnapshot struct {
 	FsUUID        string // UPPER
 	PartUUID      string // lower
 	PTUUID        string // lower (parent disk PTUUID)
 	USBSerialFull string // UPPER (ID_SERIAL), fallback SHORT
-	USBShort      string // UPPER (ID_SERIAL_SHORT)
-	USBLong       string // UPPER (VENDOR_MODEL) — 유지하되 바인딩에는 사용 안함(원하면 추가 가능)
 }
 
 func main() {
@@ -101,7 +99,7 @@ func cmdKeygen() {
 }
 
 /* =========================
-   bake (대화형) : 포맷/FAT32/SL-DONGLE + RO mount + DOS R
+   bake (대화형) : FAT32 + DOS R 속성 + RO 재마운트
    ========================= */
 func cmdBakeInteractive() {
 	reader := bufio.NewReader(os.Stdin)
@@ -165,6 +163,8 @@ func cmdBakeInteractive() {
 	must(err)
 	issued := time.Now().UTC()
 	binding := buildBindingKeyV1(devInfo)
+
+	// serial_key = SHA256(binding || "|" || issued_at_RFC3339)
 	serialKey := sha256Hex(binding + "|" + issued.Format(time.RFC3339))
 
 	// license.json (public)
@@ -184,7 +184,7 @@ func cmdBakeInteractive() {
 	must(err)
 	sig := ed25519.Sign(priv, licBytes)
 
-	// 마운트 RW → 파일 기록 → DOS R 속성 시도 → RO 재마운트
+	// 마운트 RW → 파일 기록 → DOS R 속성(mattrib -i <part> ::/path) + chmod 폴백 → sync → 언마운트 → RO 재마운트
 	must(os.MkdirAll(tmpMountPoint, 0755))
 	defer exec.Command("umount", tmpMountPoint).Run()
 
@@ -196,19 +196,23 @@ func cmdBakeInteractive() {
 	sigPath := filepath.Join(tmpMountPoint, "license.sig")
 	must(os.WriteFile(licPath, licBytes, 0644))
 	must(os.WriteFile(sigPath, sig, 0644))
+	var readmeDst string
 	if readmePath != "" {
-		dst := filepath.Join(tmpMountPoint, filepath.Base(readmePath))
-		must(copyFile(readmePath, dst))
+		readmeDst = filepath.Join(tmpMountPoint, filepath.Base(readmePath))
+		must(copyFile(readmePath, readmeDst))
 	}
 
-	// 3) DOS Read-only 속성 시도(가능한 툴 우선순위로)
-	_ = setDOSReadOnly(licPath)
-	_ = setDOSReadOnly(sigPath)
-	if readmePath != "" {
-		_ = setDOSReadOnly(filepath.Join(tmpMountPoint, filepath.Base(readmePath)))
+	// 3) sync (mattrib가 디바이스로 직접 작업하므로 캐시 반영)
+	must(exec.Command("sync").Run())
+
+	// 4) DOS Read-only 속성 시도 (장치 지정 방식) + 폴백 chmod a-w
+	_ = setDOSReadOnlyOnDevice(part, "::/license.json", licPath)
+	_ = setDOSReadOnlyOnDevice(part, "::/license.sig", sigPath)
+	if readmeDst != "" {
+		_ = setDOSReadOnlyOnDevice(part, "::/README.pdf", readmeDst)
 	}
 
-	// 4) sync → 언마운트 → RO 재마운트
+	// 5) sync → 언마운트 → RO 재마운트
 	must(exec.Command("sync").Run())
 	must(exec.Command("umount", tmpMountPoint).Run())
 	must(exec.Command("mount", "-o", "ro", part, tmpMountPoint).Run())
@@ -220,7 +224,7 @@ func cmdBakeInteractive() {
 }
 
 /* =========================
-   verify (서명 + serial_key)
+   verify (서명 + serial_key 비교)
    ========================= */
 func cmdVerify() {
 	fs := flag.NewFlagSet("verify", flag.ExitOnError)
@@ -232,17 +236,13 @@ func cmdVerify() {
 		os.Exit(2)
 	}
 
-	// 1) 현재 장치 파티션
-	dev, err := devFromMount(*mount)
-	must(err)
-
-	// 2) license 파일 로드
+	// 1) license 파일 로드
 	licBytes, err := os.ReadFile(filepath.Join(*mount, "license.json"))
 	must(err)
 	sigBytes, err := os.ReadFile(filepath.Join(*mount, "license.sig"))
 	must(err)
 
-	// 3) 서명 검증
+	// 2) 서명 검증
 	pubKey, err := loadEd25519PubFromPEM(*pub)
 	must(err)
 	if !ed25519.Verify(pubKey, licBytes, sigBytes) {
@@ -251,10 +251,12 @@ func cmdVerify() {
 	}
 	fmt.Println("signature: OK")
 
-	// 4) serial_key 비교 (장치/바인딩 노출 없음)
+	// 3) serial_key 비교 (장치/바인딩 노출 없음)
 	var lic License
 	must(json.Unmarshal(licBytes, &lic))
 
+	dev, err := devFromMount(*mount)
+	must(err)
 	info, err := collectBindingInfo(dev)
 	must(err)
 	localBinding := buildBindingKeyV1(info)
@@ -419,23 +421,16 @@ func collectBindingInfo(devPart string) (DeviceSnapshot, error) {
 		return d, err
 	}
 	kv := parseKVEq(string(props))
-	vendor := kv["ID_VENDOR"]
-	model := kv["ID_MODEL"]
 	serialFull := kv["ID_SERIAL"]
-	serialShort := kv["ID_SERIAL_SHORT"]
-
 	if serialFull == "" {
-		serialFull = serialShort
+		serialFull = kv["ID_SERIAL_SHORT"]
 	}
 	d.USBSerialFull = strings.ToUpper(strings.TrimSpace(serialFull))
-	d.USBShort = strings.ToUpper(strings.TrimSpace(serialShort))
-	usbLong := strings.TrimSpace(strings.ReplaceAll(vendor, " ", "_") + "_" + strings.ReplaceAll(model, " ", "_"))
-	d.USBLong = strings.ToUpper(strings.Trim(usbLong, "_"))
 
 	return d, nil
 }
 
-// 바인딩은 UUID 3종 + 컨트롤러 시리얼(Full)로 구성
+// 바인딩: UUID 3종 + 컨트롤러 시리얼(Full)
 func buildBindingKeyV1(d DeviceSnapshot) string {
 	return strings.Join([]string{
 		strings.ToUpper(d.FsUUID),
@@ -507,25 +502,24 @@ func loadEd25519PubFromPEM(path string) (ed25519.PublicKey, error) {
 }
 
 /* =========================
-   DOS Read-only helper (best-effort)
+   DOS Read-only helper (디바이스 지정 + 폴백 chmod)
    ========================= */
 
-func setDOSReadOnly(absPath string) error {
-	// 1) mtools: mattrib +r <path>
+func setDOSReadOnlyOnDevice(partDev, dosPath, mountedPath string) error {
+	// 1) mtools: mattrib +r -i <device> ::/path
 	if _, err := exec.LookPath("mattrib"); err == nil {
-		// mtools는 기본적으로 /etc/mtools.conf 또는 장치 자동탐지를 사용.
-		// 직접 경로 지정이 가능한 최신 mattrib는 일반 경로도 처리됨.
-		if err := exec.Command("mattrib", "+r", absPath).Run(); err == nil {
+		if err := exec.Command("mattrib", "+r", "-i", partDev, dosPath).Run(); err == nil {
 			return nil
 		}
 	}
 	// 2) fatattr (일부 배포판)
 	if _, err := exec.LookPath("fatattr"); err == nil {
-		if err := exec.Command("fatattr", "+r", absPath).Run(); err == nil {
+		if err := exec.Command("fatattr", "+r", mountedPath).Run(); err == nil {
 			return nil
 		}
 	}
-	// 3) fallback: 무시(RO 마운트가 1차 보호막)
+	// 3) fallback: 권한 쓰기 제거 (vfat에서 DOS R 비트로 매핑되는 경우가 많음)
+	_ = exec.Command("chmod", "a-w", mountedPath).Run()
 	return nil
 }
 
