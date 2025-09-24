@@ -1,752 +1,607 @@
+// main.go — Ed25519 only, hardened binding, RO mount + DOS R-attr
 package main
 
 import (
 	"bufio"
-	"bytes"
-	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
-	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
+	"regexp"
 	"strings"
 	"time"
 )
 
-// ===== 기본값 =====
-const DefaultLabel = "SL-DONGLE"
-const AlgoVersionV1 = "v1"
+const (
+	labelName     = "SL-DONGLE"      // FAT32 라벨 고정
+	tmpMountPoint = "/mnt/sd-dongle" // 임시 마운트 지점
+	privPathFix   = "privkey.pem"    // Ed25519 개인키 고정 경로 (PKCS#8)
+)
 
-// ===== 모델 =====
+/* ===== Public JSON schema (device/binding 미노출) ===== */
 type License struct {
-	// legacy
-	KeyID     string `json:"key_id,omitempty"`
-	FSUUID    string `json:"fs_uuid,omitempty"`
-	PARTUUID  string `json:"partuuid,omitempty"`
-	USBSerial string `json:"usb_serial,omitempty"` // SHORT 우선, 없으면 LONG 폴백
-	IssuedAt  int64  `json:"issued_at"`
-
-	// v1
-	KeyVersion string `json:"key_version,omitempty"` // "v1"
-	LicenseKey string `json:"license_key,omitempty"` // SHA256 hex
-	Licensee   string `json:"licensee,omitempty"`
-	IssueDate  string `json:"issue_date,omitempty"`
-
-	// 선택(기본 0=미사용)
-	NotBefore int64 `json:"nbf,omitempty"`
-	ExpiresAt int64 `json:"exp,omitempty"`
+	Version     int        `json:"version"`
+	Licensee    string     `json:"licensee"`
+	LicensePlan string     `json:"license_plan,omitempty"`
+	IssuedAt    time.Time  `json:"issued_at"`
+	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
+	SerialKey   string     `json:"serial_key"` // SHA-256(binding || "|" || issued_at_RFC3339)
+	Note        string     `json:"note,omitempty"`
 }
 
-func (l *License) Marshal() ([]byte, error) { return json.Marshal(l) }
+/* ===== Internal (노출 금지) ===== */
+type DeviceSnapshot struct {
+	FsUUID        string // UPPER
+	PartUUID      string // lower
+	PTUUID        string // lower (parent disk PTUUID)
+	USBSerialFull string // UPPER (ID_SERIAL), fallback SHORT
+	USBShort      string // UPPER (ID_SERIAL_SHORT)
+	USBLong       string // UPPER (VENDOR_MODEL) — 유지하되 바인딩에는 사용 안함(원하면 추가 가능)
+}
 
-// ===== v1 license_key 생성 =====
-func normLower(s string) string {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return "__MISSING__"
+func main() {
+	if len(os.Args) < 2 {
+		usage()
+		return
 	}
-	return strings.ToLower(s)
+	switch os.Args[1] {
+	case "keygen":
+		cmdKeygen()
+	case "bake":
+		cmdBakeInteractive()
+	case "verify":
+		cmdVerify()
+	default:
+		usage()
+	}
 }
-func makeLicenseKeyV1(fsUUID, partUUID, usbSerial string) string {
-	canonical := fmt.Sprintf("fs=%s|part=%s|usb=%s",
-		normLower(fsUUID), normLower(partUUID), normLower(usbSerial))
-	sum := sha256.Sum256([]byte(canonical))
+
+func usage() {
+	fmt.Fprintf(os.Stderr, `Usage:
+  %s keygen --out-priv privkey.pem --out-pub pubkey.pem
+  %s bake        # 대화형 발급: 포맷(FAT32), 라벨=SL-DONGLE, privkey.pem 고정, device/binding 미노출
+  %s verify --mount /path --pub pubkey.pem
+`, filepath.Base(os.Args[0]), filepath.Base(os.Args[0]), filepath.Base(os.Args[0]))
+}
+
+/* =========================
+   keygen (Ed25519 전용)
+   ========================= */
+func cmdKeygen() {
+	fs := flag.NewFlagSet("keygen", flag.ExitOnError)
+	outPriv := fs.String("out-priv", "privkey.pem", "Ed25519 private key PEM (PKCS#8)")
+	outPub := fs.String("out-pub", "pubkey.pem", "Ed25519 public key PEM (PKIX)")
+	_ = fs.Parse(os.Args[2:])
+
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	must(err)
+
+	// PRIVATE KEY (PKCS#8)
+	privDer, err := x509.MarshalPKCS8PrivateKey(priv)
+	must(err)
+	privBlk := &pem.Block{Type: "PRIVATE KEY", Bytes: privDer}
+	must(os.WriteFile(*outPriv, pem.EncodeToMemory(privBlk), 0600))
+
+	// PUBLIC KEY (PKIX)
+	pubDer, err := x509.MarshalPKIXPublicKey(pub)
+	must(err)
+	pubBlk := &pem.Block{Type: "PUBLIC KEY", Bytes: pubDer}
+	must(os.WriteFile(*outPub, pem.EncodeToMemory(pubBlk), 0644))
+
+	fmt.Printf("keygen: wrote %s and %s (Ed25519)\n", *outPriv, *outPub)
+}
+
+/* =========================
+   bake (대화형) : 포맷/FAT32/SL-DONGLE + RO mount + DOS R
+   ========================= */
+func cmdBakeInteractive() {
+	reader := bufio.NewReader(os.Stdin)
+
+	// Licensee (필수)
+	licensee := ""
+	for {
+		fmt.Print("Licensee: ")
+		licensee = readLine(reader)
+		if strings.TrimSpace(licensee) != "" {
+			break
+		}
+		fmt.Println("  (required)")
+	}
+
+	// Private key: 고정 경로 확인
+	if _, err := os.Stat(privPathFix); err != nil {
+		fatal("private key not found: %s (run `keygen` or place Ed25519 PEM)", privPathFix)
+	}
+
+	// README.pdf path (optional)
+	fmt.Print("README.pdf path (optional, empty to skip): ")
+	readmePath := strings.TrimSpace(readLine(reader))
+	if readmePath != "" {
+		if fi, err := os.Stat(readmePath); err != nil || fi.IsDir() {
+			fatal("README file not found or is a directory: %s", readmePath)
+		}
+	}
+
+	// 타깃 디스크 선택 (번호만 입력 → 즉시 진행, nvme0n1 제외)
+	disk, preview := pickTargetDiskByIndex(reader)
+	if disk == "" {
+		fatal("no disk selected")
+	}
+
+	// 요약 + 확인 (y/N)
+	fmt.Println("\nSummary:")
+	fmt.Println("  Mode=fat32")
+	fmt.Printf("  Target=%s\n", disk)
+	fmt.Printf("  Label=%s\n", labelName)
+	fmt.Printf("  Licensee=%s\n", licensee)
+	fmt.Printf("  Priv=%s\n", privPathFix)
+	if readmePath != "" {
+		fmt.Printf("  README=%s\n", readmePath)
+	} else {
+		fmt.Printf("  README=\n")
+	}
+	fmt.Print("Proceed? (y/N): ")
+	resp := strings.ToLower(strings.TrimSpace(readLine(reader)))
+	if resp != "y" && resp != "yes" {
+		fatal("aborted by user")
+	}
+
+	// === 작업 시작 ===
+	fmt.Printf("\nFormatting %s as FAT32 (%s)...\n", disk, labelName)
+	must(formatFAT32SinglePartition(disk, labelName))
+	part := findFirstPartition(disk)
+
+	// 바인딩 정보 수집(내부용)
+	devInfo, err := collectBindingInfo(part)
+	must(err)
+	issued := time.Now().UTC()
+	binding := buildBindingKeyV1(devInfo)
+	serialKey := sha256Hex(binding + "|" + issued.Format(time.RFC3339))
+
+	// license.json (public)
+	lic := License{
+		Version:     1,
+		Licensee:    licensee,
+		LicensePlan: "Standard",
+		IssuedAt:    issued,
+		ExpiresAt:   nil,
+		SerialKey:   serialKey,
+	}
+	licBytes, err := json.MarshalIndent(lic, "", "  ")
+	must(err)
+
+	// 서명 (Ed25519: 원문 바이트에 그대로 서명)
+	priv, err := loadEd25519PrivFromPEM(privPathFix)
+	must(err)
+	sig := ed25519.Sign(priv, licBytes)
+
+	// 마운트 RW → 파일 기록 → DOS R 속성 시도 → RO 재마운트
+	must(os.MkdirAll(tmpMountPoint, 0755))
+	defer exec.Command("umount", tmpMountPoint).Run()
+
+	// 1) RW 마운트
+	must(exec.Command("mount", part, tmpMountPoint).Run())
+
+	// 2) 파일 기록
+	licPath := filepath.Join(tmpMountPoint, "license.json")
+	sigPath := filepath.Join(tmpMountPoint, "license.sig")
+	must(os.WriteFile(licPath, licBytes, 0644))
+	must(os.WriteFile(sigPath, sig, 0644))
+	if readmePath != "" {
+		dst := filepath.Join(tmpMountPoint, filepath.Base(readmePath))
+		must(copyFile(readmePath, dst))
+	}
+
+	// 3) DOS Read-only 속성 시도(가능한 툴 우선순위로)
+	_ = setDOSReadOnly(licPath)
+	_ = setDOSReadOnly(sigPath)
+	if readmePath != "" {
+		_ = setDOSReadOnly(filepath.Join(tmpMountPoint, filepath.Base(readmePath)))
+	}
+
+	// 4) sync → 언마운트 → RO 재마운트
+	must(exec.Command("sync").Run())
+	must(exec.Command("umount", tmpMountPoint).Run())
+	must(exec.Command("mount", "-o", "ro", part, tmpMountPoint).Run())
+
+	fmt.Printf("\nFAT32 baked: %s (label=%s)\n", part, labelName)
+	if preview != "" {
+		fmt.Println(preview)
+	}
+}
+
+/* =========================
+   verify (서명 + serial_key)
+   ========================= */
+func cmdVerify() {
+	fs := flag.NewFlagSet("verify", flag.ExitOnError)
+	mount := fs.String("mount", "", "mount point")
+	pub := fs.String("pub", "", "Ed25519 public key PEM")
+	_ = fs.Parse(os.Args[2:])
+	if *mount == "" || *pub == "" {
+		fs.Usage()
+		os.Exit(2)
+	}
+
+	// 1) 현재 장치 파티션
+	dev, err := devFromMount(*mount)
+	must(err)
+
+	// 2) license 파일 로드
+	licBytes, err := os.ReadFile(filepath.Join(*mount, "license.json"))
+	must(err)
+	sigBytes, err := os.ReadFile(filepath.Join(*mount, "license.sig"))
+	must(err)
+
+	// 3) 서명 검증
+	pubKey, err := loadEd25519PubFromPEM(*pub)
+	must(err)
+	if !ed25519.Verify(pubKey, licBytes, sigBytes) {
+		fmt.Println("signature: BAD")
+		fatal("verify signature failed (Ed25519)")
+	}
+	fmt.Println("signature: OK")
+
+	// 4) serial_key 비교 (장치/바인딩 노출 없음)
+	var lic License
+	must(json.Unmarshal(licBytes, &lic))
+
+	info, err := collectBindingInfo(dev)
+	must(err)
+	localBinding := buildBindingKeyV1(info)
+	localSerial := sha256Hex(localBinding + "|" + lic.IssuedAt.UTC().Format(time.RFC3339))
+
+	if subtleConstTimeEq(localSerial, lic.SerialKey) {
+		fmt.Println("verify: serial_key match (OK)")
+	} else {
+		fmt.Println("verify: serial_key mismatch")
+		os.Exit(1)
+	}
+}
+
+/* =========================
+   Disk select / formatting
+   ========================= */
+
+// 번호만 입력하면 바로 진행. nvme0n1 제외.
+func pickTargetDiskByIndex(reader *bufio.Reader) (string, string) {
+	fmt.Println("Select target disk:")
+	out, err := exec.Command("lsblk",
+		"-o", "NAME,TYPE,RM,RO,SIZE,MODEL,SERIAL,TRAN,PATH",
+		"-nr").Output()
+	must(err)
+
+	type cand struct {
+		line string
+		path string
+	}
+	var cands []cand
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	exNvme := regexp.MustCompile(`^nvme0n1$`)
+	for _, ln := range lines {
+		fs := strings.Fields(ln)
+		if len(fs) < 9 {
+			continue
+		}
+		name, typ, size, model, tran, path := fs[0], fs[1], fs[4], fs[5], fs[7], fs[8]
+		if typ != "disk" {
+			continue
+		}
+		// nvme0n1 제외
+		if exNvme.MatchString(name) {
+			continue
+		}
+		tag := ""
+		if tran == "usb" {
+			tag = " [USB]"
+		}
+		line := fmt.Sprintf("%s  %s  %s%s", path, size, model, tag)
+		cands = append(cands, cand{line: line, path: path})
+	}
+
+	if len(cands) == 0 {
+		fatal("no candidate disks found")
+	}
+
+	for i, c := range cands {
+		fmt.Printf("  [%d] %s\n", i, c.line)
+	}
+
+	fmt.Print("Enter number [0]: ")
+	sel := strings.TrimSpace(readLine(reader))
+	if sel == "" {
+		sel = "0"
+	}
+	idx := 0
+	fmt.Sscanf(sel, "%d", &idx)
+	if idx < 0 || idx >= len(cands) {
+		fatal("invalid index")
+	}
+	preview := fmt.Sprintf("  Selected: %s", cands[idx].line)
+	return cands[idx].path, preview
+}
+
+// 전체 포맷(FAT32) : 단일 파티션 + 라벨
+func formatFAT32SinglePartition(disk, label string) error {
+	_ = exec.Command("umount", disk).Run()
+	_ = exec.Command("umount", disk+"1").Run()
+
+	_ = exec.Command("wipefs", "-a", disk).Run()
+
+	// DOS 파티션 테이블 + 단일 파티션
+	sfdiskInput := "label: dos\n,;\n"
+	cmd := exec.Command("sfdisk", disk)
+	cmd.Stdin = strings.NewReader(sfdiskInput)
+	if err := cmd.Run(); err != nil {
+		// fallback: parted
+		_ = exec.Command("parted", "-s", disk, "mklabel", "msdos").Run()
+		if err2 := exec.Command("parted", "-s", disk, "mkpart", "primary", "fat32", "1MiB", "100%").Run(); err2 != nil {
+			return fmt.Errorf("partitioning failed: %v / %v", err, err2)
+		}
+	}
+
+	part := findFirstPartition(disk)
+	if err := exec.Command("mkfs.vfat", "-F", "32", "-n", label, part).Run(); err != nil {
+		return fmt.Errorf("mkfs.vfat: %w", err)
+	}
+	return nil
+}
+
+func findFirstPartition(disk string) string {
+	out, err := exec.Command("lsblk", "-nr", "-o", "PATH,TYPE", disk).Output()
+	if err != nil {
+		return disk + "1"
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	for _, ln := range lines {
+		fs := strings.Fields(ln)
+		if len(fs) == 2 && fs[1] == "part" {
+			return fs[0]
+		}
+	}
+	return disk + "1"
+}
+
+func devFromMount(mnt string) (string, error) {
+	out, err := exec.Command("findmnt", "-nr", "-o", "SOURCE", "--target", mnt).Output()
+	if err != nil {
+		return "", err
+	}
+	for _, ln := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		ln = strings.TrimSpace(ln)
+		if strings.HasPrefix(ln, "/dev/") {
+			return ln, nil
+		}
+	}
+	return "", errors.New("no /dev/* source for mount")
+}
+
+/* =========================
+   Device / Binding (internal only)
+   ========================= */
+
+func collectBindingInfo(devPart string) (DeviceSnapshot, error) {
+	var d DeviceSnapshot
+
+	// FS UUID, PARTUUID, PKNAME(부모 디스크 이름)
+	uout, err := exec.Command("lsblk", "-no", "UUID,PARTUUID,PKNAME", devPart).Output()
+	if err != nil {
+		return d, err
+	}
+	fields := fieldsNoEmpty(string(uout))
+	if len(fields) > 0 {
+		d.FsUUID = strings.ToUpper(strings.TrimSpace(fields[0]))
+	}
+	if len(fields) > 1 {
+		d.PartUUID = strings.ToLower(strings.TrimSpace(fields[1]))
+	}
+	parent := ""
+	if len(fields) > 2 {
+		parent = strings.TrimSpace(fields[2])
+	}
+	if parent != "" {
+		pout, _ := exec.Command("lsblk", "-no", "PTUUID", "/dev/"+parent).Output()
+		d.PTUUID = strings.ToLower(strings.TrimSpace(string(pout)))
+	}
+
+	// udev props
+	props, err := exec.Command("udevadm", "info", "--query=property", "--name", devPart).Output()
+	if err != nil {
+		return d, err
+	}
+	kv := parseKVEq(string(props))
+	vendor := kv["ID_VENDOR"]
+	model := kv["ID_MODEL"]
+	serialFull := kv["ID_SERIAL"]
+	serialShort := kv["ID_SERIAL_SHORT"]
+
+	if serialFull == "" {
+		serialFull = serialShort
+	}
+	d.USBSerialFull = strings.ToUpper(strings.TrimSpace(serialFull))
+	d.USBShort = strings.ToUpper(strings.TrimSpace(serialShort))
+	usbLong := strings.TrimSpace(strings.ReplaceAll(vendor, " ", "_") + "_" + strings.ReplaceAll(model, " ", "_"))
+	d.USBLong = strings.ToUpper(strings.Trim(usbLong, "_"))
+
+	return d, nil
+}
+
+// 바인딩은 UUID 3종 + 컨트롤러 시리얼(Full)로 구성
+func buildBindingKeyV1(d DeviceSnapshot) string {
+	return strings.Join([]string{
+		strings.ToUpper(d.FsUUID),
+		strings.ToLower(d.PartUUID),
+		strings.ToLower(d.PTUUID),
+		strings.ToUpper(d.USBSerialFull),
+	}, "|")
+}
+
+func sha256Hex(s string) string {
+	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])
 }
 
-// ===== 키 I/O =====
-func saveKeyPair(priv ed25519.PrivateKey, pub ed25519.PublicKey) error {
-	privDER, err := x509.MarshalPKCS8PrivateKey(priv)
-	if err != nil { return fmt.Errorf("marshal private key: %w", err) }
-	pubDER, err := x509.MarshalPKIXPublicKey(pub)
-	if err != nil { return fmt.Errorf("marshal public key: %w", err) }
+/* =========================
+   Ed25519 PEM helpers
+   ========================= */
 
-	privBlock := &pem.Block{Type: "PRIVATE KEY", Bytes: privDER}
-	pubBlock  := &pem.Block{Type: "PUBLIC KEY",  Bytes: pubDER}
+func loadEd25519PrivFromPEM(path string) (ed25519.PrivateKey, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	for {
+		blk, rest := pem.Decode(b)
+		if blk == nil {
+			break
+		}
+		switch blk.Type {
+		case "PRIVATE KEY": // PKCS#8
+			k, err := x509.ParsePKCS8PrivateKey(blk.Bytes)
+			if err != nil {
+				return nil, err
+			}
+			if p, ok := k.(ed25519.PrivateKey); ok {
+				return p, nil
+			}
+			return nil, errors.New("not Ed25519 private key")
+		}
+		b = rest
+	}
+	return nil, errors.New("no Ed25519 private key found in PEM")
+}
 
-	if err := os.WriteFile("privkey.pem", pem.EncodeToMemory(privBlock), 0600); err != nil { return err }
-	if err := os.WriteFile("pubkey.pem",  pem.EncodeToMemory(pubBlock),  0644); err != nil { return err }
+func loadEd25519PubFromPEM(path string) (ed25519.PublicKey, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	for {
+		blk, rest := pem.Decode(b)
+		if blk == nil {
+			break
+		}
+		switch blk.Type {
+		case "PUBLIC KEY": // PKIX
+			pk, err := x509.ParsePKIXPublicKey(blk.Bytes)
+			if err != nil {
+				return nil, err
+			}
+			if p, ok := pk.(ed25519.PublicKey); ok {
+				return p, nil
+			}
+			return nil, errors.New("not Ed25519 public key")
+		}
+		b = rest
+	}
+	return nil, errors.New("no Ed25519 public key found in PEM")
+}
+
+/* =========================
+   DOS Read-only helper (best-effort)
+   ========================= */
+
+func setDOSReadOnly(absPath string) error {
+	// 1) mtools: mattrib +r <path>
+	if _, err := exec.LookPath("mattrib"); err == nil {
+		// mtools는 기본적으로 /etc/mtools.conf 또는 장치 자동탐지를 사용.
+		// 직접 경로 지정이 가능한 최신 mattrib는 일반 경로도 처리됨.
+		if err := exec.Command("mattrib", "+r", absPath).Run(); err == nil {
+			return nil
+		}
+	}
+	// 2) fatattr (일부 배포판)
+	if _, err := exec.LookPath("fatattr"); err == nil {
+		if err := exec.Command("fatattr", "+r", absPath).Run(); err == nil {
+			return nil
+		}
+	}
+	// 3) fallback: 무시(RO 마운트가 1차 보호막)
 	return nil
 }
 
-func execCmd(name string, args ...string) (string, error) {
-	out, err := exec.Command(name, args...).CombinedOutput()
-	s := strings.TrimSpace(string(out))
-	if err != nil { return "", fmt.Errorf("%s %v: %w: %s", name, args, err, s) }
-	return s, nil
-}
+/* =========================
+   Misc
+   ========================= */
 
-func sourceDevice(mount string) (part string, parent string, err error) {
-	src, err := execCmd("findmnt", "-no", "SOURCE", mount) // e.g. /dev/sdb1
-	if err != nil { return "", "", err }
-	part = strings.TrimSpace(src)
-	pk, err := execCmd("lsblk", "-no", "PKNAME", part) // e.g. sdb
-	if err != nil || strings.TrimSpace(pk) == "" { return part, "", fmt.Errorf("failed to get parent for %s", part) }
-	parent = "/dev/" + strings.TrimSpace(pk)
-	return part, parent, nil
-}
-
-// SHORT/LONG 둘 다 얻기
-func getUSBSerials(dev string) (shortID, longID string) {
-	out, _ := execCmd("udevadm", "info", "--query=property", "--name", dev)
-	for _, ln := range strings.Split(out, "\n") {
-		if strings.HasPrefix(ln, "ID_SERIAL_SHORT=") { shortID = strings.TrimSpace(strings.TrimPrefix(ln, "ID_SERIAL_SHORT=")) }
-		if strings.HasPrefix(ln, "ID_SERIAL=")       { longID  = strings.TrimSpace(strings.TrimPrefix(ln, "ID_SERIAL=")) }
+func subtleConstTimeEq(a, b string) bool {
+	if len(a) != len(b) {
+		return false
 	}
-	return
+	var v byte = 0
+	for i := 0; i < len(a); i++ {
+		v |= a[i] ^ b[i]
+	}
+	return v == 0
 }
 
-// 규칙: SHORT 우선, SHORT 없으면 LONG
-func pickUSB(shortID, longID string) string {
-	if shortID != "" { return shortID }
-	return longID
-}
-
-func readSerial(dev string) (serialShort, serial string) { // 기존 헬퍼 호환
-	return getUSBSerials(dev)
-}
-
-func gatherIDs(mount string) (usbSerial, fsUUID, partUUID string, err error) {
-	part, parent, err := sourceDevice(mount)
-	if err != nil { return "", "", "", err }
-	ss, s := readSerial(parent)
-	usbSerial = pickUSB(ss, s)
-	fsUUID, _   = execCmd("blkid", "-s", "UUID",     "-o", "value", part)
-	partUUID, _ = execCmd("blkid", "-s", "PARTUUID", "-o", "value", part)
-	return strings.TrimSpace(usbSerial), strings.TrimSpace(fsUUID), strings.TrimSpace(partUUID), nil
-}
-
-func loadPrivKey(path string) (ed25519.PrivateKey, error) {
-	b, err := os.ReadFile(path); if err != nil { return nil, err }
-	block, _ := pem.Decode(b);   if block == nil { return nil, errors.New("invalid PEM") }
-	keyAny, err := x509.ParsePKCS8PrivateKey(block.Bytes); if err != nil { return nil, err }
-	k, ok := keyAny.(ed25519.PrivateKey); if !ok { return nil, errors.New("not ed25519 private key") }
-	return k, nil
-}
-func loadPubKey(path string) (ed25519.PublicKey, error) {
-	b, err := os.ReadFile(path); if err != nil { return nil, err }
-	block, _ := pem.Decode(b);   if block == nil { return nil, errors.New("invalid PEM") }
-	keyAny, err := x509.ParsePKIXPublicKey(block.Bytes); if err != nil { return nil, err }
-	k, ok := keyAny.(ed25519.PublicKey); if !ok { return nil, errors.New("not ed25519 public key") }
-	return k, nil
-}
-
-// ===== 서명 =====
-func sign(bytes []byte, priv ed25519.PrivateKey) []byte { return ed25519.Sign(priv, bytes) }
-func verify(bytes, sig []byte, pub ed25519.PublicKey) bool { return ed25519.Verify(pub, bytes, sig) }
-
-// ===== 파일 IO =====
-func writeIfChanged(path string, data []byte, mode fs.FileMode) error {
-	if old, err := os.ReadFile(path); err == nil && bytes.Equal(old, data) { return nil }
-	return os.WriteFile(path, data, mode)
-}
 func copyFile(src, dst string) error {
-	in, err := os.Open(src); if err != nil { return err }
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
 	defer in.Close()
-	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil { return err }
-	out, err := os.Create(dst); if err != nil { return err }
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
 	defer out.Close()
-	if _, err := io.Copy(out, in); err != nil { return err }
+	if _, err := out.ReadFrom(in); err != nil {
+		return err
+	}
 	return out.Sync()
 }
 
-// ===== 기본 명령들 =====
-func cmdGenKey() error {
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil { return err }
-	if err := saveKeyPair(priv, pub); err != nil { return err }
-	fmt.Println("generated privkey.pem, pubkey.pem")
-	return nil
-}
-
-func cmdVerify(ctx context.Context, mount, pubPath string) error {
-	jb, err := os.ReadFile(filepath.Join(mount, "license.json")); if err != nil { return fmt.Errorf("read license.json: %w", err) }
-	sb64, err := os.ReadFile(filepath.Join(mount, "license.sig")); if err != nil { return fmt.Errorf("read license.sig: %w", err) }
-	sig, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(sb64))); if err != nil { return fmt.Errorf("decode sig: %w", err) }
-	pub, err := loadPubKey(pubPath); if err != nil { return err }
-	if !verify(jb, sig, pub) { return errors.New("signature invalid") }
-
-	var lic License
-	if err := json.Unmarshal(jb, &lic); err != nil { return err }
-
-	// 현재 장치 식별자
-	part, parent, err := sourceDevice(mount); if err != nil { return err }
-	devShort, devLong := getUSBSerials(parent)
-	devUSB := pickUSB(devShort, devLong)
-
-	fsUUID, _ := execCmd("blkid", "-s", "UUID", "-o", "value", part)
-	partUUID, _ := execCmd("blkid", "-s", "PARTUUID", "-o", "value", part)
-	fsUUID = strings.TrimSpace(fsUUID); partUUID = strings.TrimSpace(partUUID)
-
-	// v1 경로
-	if strings.EqualFold(lic.KeyVersion, AlgoVersionV1) && lic.LicenseKey != "" {
-		expect := makeLicenseKeyV1(fsUUID, partUUID, devUSB)
-		fmt.Println("signature: OK")
-		fmt.Printf("device: fs_uuid=%q, partuuid=%q, usb_serial=%q\n", fsUUID, partUUID, devUSB)
-		if lic.LicenseKey != expect {
-			return fmt.Errorf("binding check failed (v1): license_key mismatch")
+func fieldsNoEmpty(s string) []string {
+	all := strings.Fields(s)
+	res := make([]string, 0, len(all))
+	for _, f := range all {
+		if f != "" && f != "-" {
+			res = append(res, f)
 		}
-		fmt.Println("binding: OK (v1 license_key matches)")
-		return nil
 	}
-
-	// 존재하는 필드만 비교 (legacy)
-	mismatch := []string{}
-	if lic.FSUUID   != "" && lic.FSUUID   != fsUUID   { mismatch = append(mismatch, fmt.Sprintf("fs_uuid mismatch (lic=%q, dev=%q)", lic.FSUUID,   fsUUID)) }
-	if lic.PARTUUID != "" && lic.PARTUUID != partUUID { mismatch = append(mismatch, fmt.Sprintf("partuuid mismatch (lic=%q, dev=%q)", lic.PARTUUID, partUUID)) }
-	if lic.USBSerial!= "" && lic.USBSerial!= devUSB   { mismatch = append(mismatch, fmt.Sprintf("usb_serial mismatch (lic=%q, dev=%q)", lic.USBSerial, devUSB)) }
-
-	fmt.Println("signature: OK")
-	fmt.Printf("device: fs_uuid=%q, partuuid=%q, usb_serial=%q\n", fsUUID, partUUID, devUSB)
-	if len(mismatch) > 0 { return fmt.Errorf("binding check failed:\n  - %s", strings.Join(mismatch, "\n  - ")) }
-	fmt.Println("binding: OK (all specified identifiers match)")
-	return nil
+	return res
 }
 
-// ===== Bake (iso | fat32 | ext4 | update-only) =====
-type BakeMode string
-const (
-	ModeISO   BakeMode = "iso"
-	ModeFAT32 BakeMode = "fat32"
-	ModeEXT4  BakeMode = "ext4"
-)
-
-type BakeOpts struct {
-	Mode       BakeMode
-	Target     string
-	PrivPath   string
-	Licensee   string
-	KeyID      string
-	Label      string
-	Readme     string // 루트에 README.pdf로 배치(옵션)
-	Force      bool
-	Timeout    time.Duration
-
-	UpdateOnly bool   // true면 포맷/파티션 없이 라이선스만 갱신
-	MountPath  string // --update-only일 때 필요
-}
-
-func checkTool(name string) error {
-	_, err := exec.LookPath(name)
-	if err != nil { return fmt.Errorf("tool %q not found in PATH", name) }
-	return nil
-}
-func confirmErase(dev string) error {
-	fmt.Printf("!!! ALL DATA ON %s WILL BE ERASED. Continue? [yes/NO] ", dev)
-	var s string
-	if _, err := fmt.Scanln(&s); err != nil { return fmt.Errorf("aborted") }
-	if strings.TrimSpace(s) != "yes" { return fmt.Errorf("aborted") }
-	return nil
-}
-func unmountAllUnder(dev string) {
-	_ = exec.Command("bash", "-lc", fmt.Sprintf(`
-for p in $(lsblk -ln -o NAME %s | tail -n +2); do
-  mp="/dev/$p"; mountpoint -q "$mp" && sudo umount -f "$mp" || true
-done`, dev)).Run()
-}
-func parentBlockName(dev string) (string, error) {
-	out, err := execCmd("lsblk", "-no", "NAME,TYPE", dev)
-	if err != nil { return "", err }
-	f := strings.Fields(out)
-	if len(f) >= 2 && f[1] == "disk" { return "/dev/" + f[0], nil }
-	return "", fmt.Errorf("not a disk: %s", dev)
-}
-func writeLicenseFiles(dir string, lic *License, priv ed25519.PrivateKey) error {
-	jb, err := lic.Marshal(); if err != nil { return err }
-	sig := sign(jb, priv)
-	if err := os.WriteFile(filepath.Join(dir, "license.json"), jb, 0644); err != nil { return err }
-	return os.WriteFile(filepath.Join(dir, "license.sig"), []byte(base64.StdEncoding.EncodeToString(sig)), 0644)
-}
-
-// ---- Update Only (재발급 전용) ----
-func bakeUpdateOnly(opts BakeOpts) error {
-	if opts.MountPath == "" { return fmt.Errorf("--mount is required with --update-only") }
-	if _, err := os.Stat(opts.MountPath); err != nil { return fmt.Errorf("mount path not accessible: %w", err) }
-
-	usb, fsu, pu, err := gatherIDs(opts.MountPath) // SHORT 우선
-	if err != nil { return err }
-
-	priv, err := loadPrivKey(opts.PrivPath); if err != nil { return err }
-
-	// v1 포맷으로 발급
-	lic := &License{
-		KeyID:      opts.KeyID,
-		KeyVersion: AlgoVersionV1,
-		LicenseKey: makeLicenseKeyV1(strings.TrimSpace(fsu), strings.TrimSpace(pu), strings.TrimSpace(usb)),
-		Licensee:   strings.TrimSpace(opts.Licensee),
-		IssueDate:  time.Now().Format("2006/01/02"),
-		IssuedAt:   time.Now().Unix(),
-	}
-
-	if err := writeLicenseFiles(opts.MountPath, lic, priv); err != nil { return err }
-	fmt.Println("license updated at", opts.MountPath)
-	return nil
-}
-
-// ---- ISO ----
-func bakeISO(opts BakeOpts) error {
-	if err := checkTool("xorriso"); err != nil { return err }
-	if err := checkTool("dd"); err != nil { return err }
-
-	if opts.Label == "" { opts.Label = DefaultLabel }
-
-	pb, err := parentBlockName(opts.Target); if err != nil { return err }
-	if !opts.Force { if err := confirmErase(opts.Target); err != nil { return err } }
-	unmountAllUnder(opts.Target); _ = exec.Command("udevadm", "settle").Run()
-
-	// 시리얼: SHORT 우선
-	ss, s := getUSBSerials(pb)
-	usbSerial := pickUSB(ss, s)
-
-	priv, err := loadPrivKey(opts.PrivPath); if err != nil { return err }
-
-	stage, err := os.MkdirTemp("", "dongle_stage_*"); if err != nil { return err }
-	defer os.RemoveAll(stage)
-
-	if opts.Readme != "" {
-		if err := copyFile(opts.Readme, filepath.Join(stage, "README.pdf")); err != nil { return fmt.Errorf("copy README: %w", err) }
-	}
-	// ISO는 fs/part UUID가 없으므로 레거시 형태 유지(USBSerial만)
-	lic := &License{ KeyID: opts.KeyID, Licensee: opts.Licensee, USBSerial: strings.TrimSpace(usbSerial), IssuedAt: time.Now().Unix() }
-	if err := writeLicenseFiles(stage, lic, priv); err != nil { return err }
-
-	ctx, cancel := context.WithTimeout(context.Background(), opts.Timeout); defer cancel()
-	f, err := os.CreateTemp("", "dongle_*.iso"); if err != nil { return err }
-	isoPath := f.Name(); _ = f.Close()
-	defer os.Remove(isoPath)
-
-	mkisofs := exec.CommandContext(ctx, "xorriso", "-as", "mkisofs",
-		"-r", "-J", "-V", opts.Label, "-o", isoPath, stage)
-	mkisofs.Stdout, mkisofs.Stderr = os.Stdout, os.Stderr
-	if err := mkisofs.Run(); err != nil { return fmt.Errorf("xorriso failed: %w", err) }
-	fmt.Println("ISO image:", isoPath)
-
-	dd := exec.CommandContext(ctx, "sudo", "dd", "if="+isoPath, "of="+opts.Target, "bs=16M", "oflag=direct", "status=progress")
-	dd.Stdout, dd.Stderr = os.Stdout, os.Stderr
-	if err := dd.Run(); err != nil { return fmt.Errorf("dd failed: %w", err) }
-	_ = exec.Command("sync").Run()
-
-	fmt.Printf("ISO baked: %s (label=%s)\n", opts.Target, opts.Label)
-	_ = exec.Command("lsblk", "-f", opts.Target).Run()
-	return nil
-}
-
-// ---- 공통: MBR 파티션 ----
-func createMBRSinglePartition(dev string, partType string) (string, error) {
-	if err := exec.Command("sudo", "parted", "-s", dev, "mklabel", "msdos").Run(); err != nil {
-		return "", fmt.Errorf("parted mklabel: %w", err)
-	}
-	if err := exec.Command("sudo", "parted", "-s", dev, "mkpart", "primary", partType, "1MiB", "100%").Run(); err != nil {
-		return "", fmt.Errorf("parted mkpart: %w", err)
-	}
-	out, _ := execCmd("bash", "-lc", fmt.Sprintf(`lsblk -ln -o NAME "%s" | sed -n '2p'`, dev))
-	part := strings.TrimSpace(out)
-	if part == "" { return "", fmt.Errorf("partition create failed") }
-	return "/dev/" + part, nil
-}
-
-// ---- FAT32 (읽기전용 속성 자동) ----
-func bakeFAT32(opts BakeOpts) error {
-	if err := checkTool("parted"); err != nil { return err }
-	if err := checkTool("mkfs.vfat"); err != nil { return err }
-	if err := checkTool("blkid"); err != nil { return err }
-
-	if opts.Label == "" { opts.Label = DefaultLabel }
-
-	pb, err := parentBlockName(opts.Target); if err != nil { return err }
-	if !opts.Force { if err := confirmErase(opts.Target); err != nil { return err } }
-	unmountAllUnder(opts.Target); _ = exec.Command("udevadm", "settle").Run()
-
-	part, err := createMBRSinglePartition(opts.Target, "fat32"); if err != nil { return err }
-
-	if err := exec.Command("sudo", "mkfs.vfat", "-F", "32", "-n", opts.Label, part).Run(); err != nil {
-		return fmt.Errorf("mkfs.vfat: %w", err)
-	}
-	_ = exec.Command("udevadm", "settle").Run()
-
-	// ID/UUID
-	fsUUID, _   := execCmd("blkid", "-s", "UUID",     "-o", "value", part)
-	partUUID, _ := execCmd("blkid", "-s", "PARTUUID", "-o", "value", part)
-	ss, s := getUSBSerials(pb)
-	usbSerial := pickUSB(ss, s)
-
-	// 마운트
-	mnt := "/mnt/sl_dongle_tmp"
-	_ = exec.Command("sudo", "mkdir", "-p", mnt).Run()
-	if err := exec.Command("sudo", "mount", part, mnt).Run(); err != nil { return fmt.Errorf("mount: %w", err) }
-	defer exec.Command("sudo", "umount", mnt).Run()
-
-	// 스테이징 후 복사
-	tmp, err := os.MkdirTemp("", "stage_*"); if err != nil { return err }
-	defer os.RemoveAll(tmp)
-	if opts.Readme != "" {
-		if err := copyFile(opts.Readme, filepath.Join(tmp, "README.pdf")); err != nil { return err }
-	}
-	priv, err := loadPrivKey(opts.PrivPath); if err != nil { return err }
-	// v1 포맷으로 기록
-	lic := &License{
-		KeyID:      opts.KeyID,
-		KeyVersion: AlgoVersionV1,
-		LicenseKey: makeLicenseKeyV1(strings.TrimSpace(fsUUID), strings.TrimSpace(partUUID), strings.TrimSpace(usbSerial)),
-		Licensee:   opts.Licensee,
-		IssueDate:  time.Now().Format("2006/01/02"),
-		IssuedAt:   time.Now().Unix(),
-	}
-	if err := writeLicenseFiles(tmp, lic, priv); err != nil { return err }
-	if err := exec.Command("bash", "-lc", fmt.Sprintf(`sudo cp -a "%s"/. "%s"/`, tmp, mnt)).Run(); err != nil { return err }
-
-	// 읽기전용 속성 지정 (mtools 있으면 FAT 속성 비트 +r)
-	readmePath := filepath.Join(mnt, "README.pdf")
-	licenseJSON := filepath.Join(mnt, "license.json")
-	licenseSIG  := filepath.Join(mnt, "license.sig")
-	_, mattribErr := exec.LookPath("mattrib")
-	if mattribErr == nil {
-		cmds := [][]string{}
-		if _, err := os.Stat(licenseJSON); err == nil { cmds = append(cmds, []string{"mattrib", "+r", "-i", part, "::/license.json"}) }
-		if _, err := os.Stat(licenseSIG); err == nil { cmds = append(cmds, []string{"mattrib", "+r", "-i", part, "::/license.sig"}) }
-		if _, err := os.Stat(readmePath); err == nil { cmds = append(cmds, []string{"mattrib", "+r", "-i", part, "::/README.pdf"}) }
-		for _, c := range cmds {
-			if out, err := execCmd("sudo", c[0], c[1], c[2], c[3], c[4]); err != nil {
-				fmt.Fprintf(os.Stderr, "mattrib warn: %v (out=%s)\n", err, out)
-			}
-		}
-	} else {
-		// 폴백: 권한으로만 쓰기 금지
-		if _, err := os.Stat(licenseJSON); err == nil { _ = exec.Command("sudo", "chmod", "a-w", licenseJSON).Run() }
-		if _, err := os.Stat(licenseSIG); err == nil { _ = exec.Command("sudo", "chmod", "a-w", licenseSIG).Run() }
-		if _, err := os.Stat(readmePath); err == nil { _ = exec.Command("sudo", "chmod", "a-w", readmePath).Run() }
-	}
-
-	_ = exec.Command("sync").Run()
-
-	fmt.Printf("FAT32 baked: %s1 (label=%s)\n", opts.Target, opts.Label)
-	_ = exec.Command("lsblk", "-f", opts.Target).Run()
-	return nil
-}
-
-// ---- EXT4 ----
-func bakeEXT4(opts BakeOpts) error {
-	if err := checkTool("parted"); err != nil { return err }
-	if err := checkTool("mkfs.ext4"); err != nil { return err }
-	if err := checkTool("blkid"); err != nil { return err }
-
-	if opts.Label == "" { opts.Label = DefaultLabel }
-
-	pb, err := parentBlockName(opts.Target); if err != nil { return err }
-	if !opts.Force { if err := confirmErase(opts.Target); err != nil { return err } }
-	unmountAllUnder(opts.Target); _ = exec.Command("udevadm", "settle").Run()
-
-	part, err := createMBRSinglePartition(opts.Target, "ext4"); if err != nil { return err }
-
-	if err := exec.Command("sudo", "mkfs.ext4", "-F", "-L", opts.Label, part).Run(); err != nil {
-		return fmt.Errorf("mkfs.ext4: %w", err)
-	}
-	_ = exec.Command("udevadm", "settle").Run()
-
-	fsUUID, _   := execCmd("blkid", "-s", "UUID",     "-o", "value", part)
-	partUUID, _ := execCmd("blkid", "-s", "PARTUUID", "-o", "value", part)
-	ss, s := getUSBSerials(pb)
-	usbSerial := pickUSB(ss, s)
-
-	mnt := "/mnt/sl_dongle_tmp"
-	_ = exec.Command("sudo", "mkdir", "-p", mnt).Run()
-	if err := exec.Command("sudo", "mount", part, mnt).Run(); err != nil { return fmt.Errorf("mount: %w", err) }
-	defer exec.Command("sudo", "umount", mnt).Run()
-
-	tmp, err := os.MkdirTemp("", "stage_*"); if err != nil { return err }
-	defer os.RemoveAll(tmp)
-	if opts.Readme != "" {
-		if err := copyFile(opts.Readme, filepath.Join(tmp, "README.pdf")); err != nil { return err }
-	}
-	priv, err := loadPrivKey(opts.PrivPath); if err != nil { return err }
-	// v1 포맷으로 기록
-	lic := &License{
-		KeyID:      opts.KeyID,
-		KeyVersion: AlgoVersionV1,
-		LicenseKey: makeLicenseKeyV1(strings.TrimSpace(fsUUID), strings.TrimSpace(partUUID), strings.TrimSpace(usbSerial)),
-		Licensee:   opts.Licensee,
-		IssueDate:  time.Now().Format("2006/01/02"),
-		IssuedAt:   time.Now().Unix(),
-	}
-	if err := writeLicenseFiles(tmp, lic, priv); err != nil { return err }
-	if err := exec.Command("bash", "-lc", fmt.Sprintf(`sudo cp -a "%s"/. "%s"/`, tmp, mnt)).Run(); err != nil { return err }
-	_ = exec.Command("sync").Run()
-
-	fmt.Printf("EXT4 baked: %s1 (label=%s)\n", opts.Target, opts.Label)
-	_ = exec.Command("lsblk", "-f", opts.Target).Run()
-	return nil
-}
-
-func cmdBake(opts BakeOpts) error {
-	if opts.UpdateOnly {
-		return bakeUpdateOnly(opts)
-	}
-	if opts.Timeout == 0 { opts.Timeout = 10 * time.Minute }
-	switch opts.Mode {
-	case ModeISO:   return bakeISO(opts)
-	case ModeFAT32: return bakeFAT32(opts)
-	case ModeEXT4:  return bakeEXT4(opts)
-	default:        return fmt.Errorf("unknown mode: %s (use iso|fat32|ext4)", opts.Mode)
-	}
-}
-
-// ===== 대화형 유틸 =====
-func prompt(r *bufio.Reader, label string, def string) (string, error) {
-	if def != "" { fmt.Printf("%s [%s]: ", label, def) } else { fmt.Printf("%s: ", label) }
-	s, err := r.ReadString('\n'); if err != nil { return "", err }
-	s = strings.TrimSpace(s)
-	if s == "" { return def, nil }
-	return s, nil
-}
-func promptYN(r *bufio.Reader, label string, defNo bool) (bool, error) {
-    if defNo {
-        fmt.Printf("%s (y/N): ", label)
-    } else {
-        fmt.Printf("%s (Y/n): ", label)
-    }
-
-    s, err := r.ReadString('\n')
-    if err != nil { return false, err }
-    s = strings.TrimSpace(strings.ToLower(s))
-
-    if s == "" {
-        return !defNo, nil
-    }
-    return s == "y" || s == "yes", nil
-}
-
-
-type DevInfo struct {
-	Path  string
-	Size  string
-	Model string
-	Tran  string
-	Type  string
-	RM    string // "1" removable, "0" non-removable
-}
-
-func listCandidateDisks() ([]DevInfo, error) {
-	// -P : key="val" 출력 → 공백/빈 문자열에도 안전
-	out, err := execCmd("lsblk", "-dn", "-o", "NAME,SIZE,MODEL,TRAN,TYPE,RM", "-P")
-	if err != nil { return nil, err }
-
-	parseKV := func(line string) map[string]string {
-		m := map[string]string{}
-		// 예: NAME="sdb" SIZE="59G" MODEL="" TRAN="usb" TYPE="disk" RM="1"
-		for _, tok := range strings.Fields(line) {
-			kv := strings.SplitN(tok, "=", 2)
-			if len(kv) != 2 { continue }
-			key := kv[0]
-			val := strings.Trim(kv[1], `"`)
-			m[key] = val
-		}
-		return m
-	}
-
-	var res []DevInfo
-	for _, ln := range strings.Split(out, "\n") {
+func parseKVEq(s string) map[string]string {
+	m := map[string]string{}
+	for _, ln := range strings.Split(s, "\n") {
 		ln = strings.TrimSpace(ln)
-		if ln == "" { continue }
-		kv := parseKV(ln)
-		if kv["TYPE"] != "disk" { continue }
-
-		name := kv["NAME"]
-		if name == "" { continue }
-
-		di := DevInfo{
-			Path:  "/dev/" + name,
-			Size:  kv["SIZE"],
-			Model: kv["MODEL"],        // 빈 문자열이어도 OK
-			Tran:  kv["TRAN"],         // 빈 문자열이어도 OK
-			Type:  kv["TYPE"],
-			RM:    kv["RM"],
+		if ln == "" || strings.HasPrefix(ln, "#") {
+			continue
 		}
-		res = append(res, di)
+		i := strings.IndexByte(ln, '=')
+		if i <= 0 {
+			continue
+		}
+		k := strings.TrimSpace(ln[:i])
+		v := strings.TrimSpace(ln[i+1:])
+		m[k] = v
 	}
-	return res, nil
+	return m
 }
 
-
-func interactiveBake(base BakeOpts) (BakeOpts, error) {
-	r := bufio.NewReader(os.Stdin)
-	opts := base
-
-	// 기본값
-	if opts.PrivPath == "" { opts.PrivPath = "privkey.pem" }
-	if opts.KeyID == ""    { opts.KeyID = "k1" }
-	if opts.Label == ""    { opts.Label = DefaultLabel }
-	if opts.Mode == ""     { opts.Mode = ModeFAT32 }
-
-	// Update-only?
-	upd, err := promptYN(r, "Update only (license files only, no repartition/format)?", true) // 기본 N
-	if err != nil { return opts, err }
-	opts.UpdateOnly = upd
-
-	if opts.UpdateOnly {
-		// 마운트 경로만 받으면 됨
-		mp, err := prompt(r, "Mount path (e.g. /media/dongle)", "")
-		if err != nil { return opts, err }
-		if strings.TrimSpace(mp) == "" { return opts, fmt.Errorf("mount path is required for update-only") }
-		opts.MountPath = mp
-
-		// 라이선시/라벨/키/priv/README 등은 그대로 질문
-		lic, err := prompt(r, "Licensee", opts.Licensee); if err != nil { return opts, err }
-		opts.Licensee = lic
-		lab, err := prompt(r, "Label", opts.Label); if err != nil { return opts, err }
-		opts.Label = lab
-		kid, err := prompt(r, "Key-ID", opts.KeyID); if err != nil { return opts, err }
-		opts.KeyID = kid
-		priv, err := prompt(r, "Private key path", opts.PrivPath); if err != nil { return opts, err }
-		opts.PrivPath = priv
-
-		fmt.Printf("\nSummary (update-only):\n  Mount=%s\n  Licensee=%s\n  KeyID=%s\n  Priv=%s\n",
-			opts.MountPath, opts.Licensee, opts.KeyID, opts.PrivPath)
-		yn, err := prompt(r, "Proceed? (yes/no)", "yes"); if err != nil { return opts, err }
-		if strings.ToLower(yn) != "yes" { return opts, fmt.Errorf("aborted") }
-		return opts, nil
-	}
-
-	// 일반 제작 플로우
-	m, err := prompt(r, "Mode (iso|fat32|ext4)", string(opts.Mode)); if err != nil { return opts, err }
-	opts.Mode = BakeMode(strings.ToLower(m))
-
-	lic, err := prompt(r, "Licensee", opts.Licensee); if err != nil { return opts, err }
-	opts.Licensee = lic
-
-	lab, err := prompt(r, "Label", opts.Label); if err != nil { return opts, err }
-	opts.Label = lab
-
-	kid, err := prompt(r, "Key-ID", opts.KeyID); if err != nil { return opts, err }
-	opts.KeyID = kid
-
-	priv, err := prompt(r, "Private key path", opts.PrivPath); if err != nil { return opts, err }
-	opts.PrivPath = priv
-
-	rd, err := prompt(r, "README.pdf path (optional, empty to skip)", ""); if err != nil { return opts, err }
-	opts.Readme = strings.TrimSpace(rd)
-
-	// 디스크 선택
-	if opts.Target == "" {
-		list, err := listCandidateDisks(); if err != nil { return opts, err }
-		if len(list) == 0 { return opts, fmt.Errorf("no disks found by lsblk") }
-
-		fmt.Println("Select target disk:")
-		for i, d := range list {
-			tag := ""
-			if strings.EqualFold(d.Tran, "usb") || d.RM == "1" {
-				tag = " [USB]"
-			}
-			model := d.Model
-			if strings.TrimSpace(model) == "" {
-				model = "(no-model)"
-			}
-			fmt.Printf("  [%d] %s  %s  %s%s\n", i, d.Path, d.Size, model, tag)
-		}
-		for {
-			iv, err := prompt(r, "Enter number", "0"); if err != nil { return opts, err }
-			idx, err := strconv.Atoi(iv); if err != nil || idx < 0 || idx >= len(list) {
-				fmt.Println("invalid index, try again")
-				continue
-			}
-			opts.Target = list[idx].Path
-			break
-		}
-	}
-
-	fmt.Printf("\nSummary:\n  Mode=%s\n  Target=%s\n  Label=%s\n  Licensee=%s\n  KeyID=%s\n  Priv=%s\n  README=%s\n",
-		opts.Mode, opts.Target, opts.Label, opts.Licensee, opts.KeyID, opts.PrivPath, opts.Readme)
-	yn, err := prompt(r, "Proceed? (yes/no)", "yes"); if err != nil { return opts, err }
-	if strings.ToLower(yn) != "yes" { return opts, fmt.Errorf("aborted") }
-
-	opts.Force = true // 이미 확인 받았으니 강제 진행
-	return opts, nil
+func readLine(r *bufio.Reader) string {
+	s, _ := r.ReadString('\n')
+	return strings.TrimSpace(s)
 }
 
-// ===== main =====
-func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("usage:")
-		fmt.Println("  syncLauperDongleMaker genkey")
-		fmt.Println("  syncLauperDongleMaker verify  --mount /media/dongle --pub  pubkey.pem")
-		fmt.Println("  syncLauperDongleMaker bake    [--update-only --mount /media/dongle] [--mode iso|fat32|ext4] [--target /dev/sdX] [--priv privkey.pem] [--licensee NAME] [--key-id K] [--label LABEL] [--readme README.pdf] [--force]")
-		fmt.Println("       (no options → interactive wizard; default: fat32)")
-		os.Exit(2)
+func must(err error) {
+	if err != nil {
+		fatal("%v", err)
 	}
+}
 
-	switch os.Args[1] {
-	case "genkey":
-		if err := cmdGenKey(); err != nil { fmt.Fprintln(os.Stderr, "genkey:", err); os.Exit(1) }
-	case "verify":
-		fs := flag.NewFlagSet("verify", flag.ExitOnError)
-		mount := fs.String("mount", "/media/dongle", "mount path of dongle")
-		pub   := fs.String("pub", "pubkey.pem", "ed25519 public key (PEM)")
-		_ = fs.Parse(os.Args[2:])
-		ctx := context.Background()
-		if err := cmdVerify(ctx, *mount, *pub); err != nil { fmt.Fprintln(os.Stderr, "verify:", err); os.Exit(1) }
-	case "bake":
-		fs := flag.NewFlagSet("bake", flag.ExitOnError)
-		updateOnly := fs.Bool("update-only", false, "update license files only (no repartition/format)")
-		mountPath  := fs.String("mount", "", "mount path (required with --update-only)")
-
-		mode   := fs.String("mode", "", "iso | fat32 | ext4")
-		target := fs.String("target", "", "target disk (e.g. /dev/sdX)")
-		priv   := fs.String("priv", "privkey.pem", "ed25519 private key (PEM)")
-		licensee := fs.String("licensee", "", "optional licensee name")
-		keyID    := fs.String("key-id", "k1", "optional key id")
-		label    := fs.String("label", DefaultLabel, "volume label")
-		readme   := fs.String("readme", "", "optional README.pdf path (placed at /README.pdf)")
-		force    := fs.Bool("force", false, "do not ask for confirmation")
-		_ = fs.Parse(os.Args[2:])
-
-		opts := BakeOpts{
-			UpdateOnly: *updateOnly,
-			MountPath:  *mountPath,
-
-			Mode: BakeMode(strings.ToLower(*mode)),
-			Target: *target, PrivPath: *priv,
-			Licensee: *licensee, KeyID: *keyID,
-			Label: *label, Readme: *readme,
-			Force: *force, Timeout: 10*time.Minute,
-		}
-
-		// 옵션이 거의 비어있으면 대화형 진입
-		if !*updateOnly && *mode == "" && *target == "" && !*force && *licensee == "" && *label == DefaultLabel && *keyID == "k1" && *readme == "" && *mountPath == "" {
-			var err error
-			opts, err = interactiveBake(opts)
-			if err != nil { fmt.Fprintln(os.Stderr, "bake (interactive):", err); os.Exit(1) }
-		} else if *updateOnly && *mountPath == "" {
-			// update-only 모드에 mount가 없으면 대화형으로 보완
-			var err error
-			opts2, err := interactiveBake(opts)
-			if err != nil { fmt.Fprintln(os.Stderr, "bake (interactive):", err); os.Exit(1) }
-			opts = opts2
-		} else {
-			// 모드 기본값
-			if !opts.UpdateOnly && opts.Mode == "" { opts.Mode = ModeFAT32 }
-		}
-
-		if !opts.UpdateOnly && opts.Target == "" {
-			fmt.Fprintln(os.Stderr, "bake: --target /dev/sdX is required (or run without options for interactive)")
-			os.Exit(2)
-		}
-
-		if err := cmdBake(opts); err != nil {
-			fmt.Fprintln(os.Stderr, "bake:", err); os.Exit(1)
-		}
-	default:
-		fmt.Fprintln(os.Stderr, "unknown command:", os.Args[1])
-		os.Exit(2)
-	}
+func fatal(fmtStr string, a ...any) {
+	fmt.Fprintf(os.Stderr, "ERROR: "+fmtStr+"\n", a...)
+	os.Exit(1)
 }
