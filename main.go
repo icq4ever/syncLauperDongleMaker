@@ -6,8 +6,10 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -25,15 +27,22 @@ import (
 
 // ===== 기본값 =====
 const DefaultLabel = "SL-DONGLE"
+const AlgoVersionV1 = "v1"
 
 // ===== 모델 =====
 type License struct {
+	// legacy
 	KeyID     string `json:"key_id,omitempty"`
-	Licensee  string `json:"licensee,omitempty"`
 	FSUUID    string `json:"fs_uuid,omitempty"`
 	PARTUUID  string `json:"partuuid,omitempty"`
 	USBSerial string `json:"usb_serial,omitempty"` // SHORT 우선, 없으면 LONG 폴백
 	IssuedAt  int64  `json:"issued_at"`
+
+	// v1
+	KeyVersion string `json:"key_version,omitempty"` // "v1"
+	LicenseKey string `json:"license_key,omitempty"` // SHA256 hex
+	Licensee   string `json:"licensee,omitempty"`
+	IssueDate  string `json:"issue_date,omitempty"`
 
 	// 선택(기본 0=미사용)
 	NotBefore int64 `json:"nbf,omitempty"`
@@ -41,6 +50,21 @@ type License struct {
 }
 
 func (l *License) Marshal() ([]byte, error) { return json.Marshal(l) }
+
+// ===== v1 license_key 생성 =====
+func normLower(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "__MISSING__"
+	}
+	return strings.ToLower(s)
+}
+func makeLicenseKeyV1(fsUUID, partUUID, usbSerial string) string {
+	canonical := fmt.Sprintf("fs=%s|part=%s|usb=%s",
+		normLower(fsUUID), normLower(partUUID), normLower(usbSerial))
+	sum := sha256.Sum256([]byte(canonical))
+	return hex.EncodeToString(sum[:])
+}
 
 // ===== 키 I/O =====
 func saveKeyPair(priv ed25519.PrivateKey, pub ed25519.PublicKey) error {
@@ -166,7 +190,19 @@ func cmdVerify(ctx context.Context, mount, pubPath string) error {
 	partUUID, _ := execCmd("blkid", "-s", "PARTUUID", "-o", "value", part)
 	fsUUID = strings.TrimSpace(fsUUID); partUUID = strings.TrimSpace(partUUID)
 
-	// 존재하는 필드만 비교
+	// v1 경로
+	if strings.EqualFold(lic.KeyVersion, AlgoVersionV1) && lic.LicenseKey != "" {
+		expect := makeLicenseKeyV1(fsUUID, partUUID, devUSB)
+		fmt.Println("signature: OK")
+		fmt.Printf("device: fs_uuid=%q, partuuid=%q, usb_serial=%q\n", fsUUID, partUUID, devUSB)
+		if lic.LicenseKey != expect {
+			return fmt.Errorf("binding check failed (v1): license_key mismatch")
+		}
+		fmt.Println("binding: OK (v1 license_key matches)")
+		return nil
+	}
+
+	// 존재하는 필드만 비교 (legacy)
 	mismatch := []string{}
 	if lic.FSUUID   != "" && lic.FSUUID   != fsUUID   { mismatch = append(mismatch, fmt.Sprintf("fs_uuid mismatch (lic=%q, dev=%q)", lic.FSUUID,   fsUUID)) }
 	if lic.PARTUUID != "" && lic.PARTUUID != partUUID { mismatch = append(mismatch, fmt.Sprintf("partuuid mismatch (lic=%q, dev=%q)", lic.PARTUUID, partUUID)) }
@@ -244,17 +280,14 @@ func bakeUpdateOnly(opts BakeOpts) error {
 
 	priv, err := loadPrivKey(opts.PrivPath); if err != nil { return err }
 
+	// v1 포맷으로 발급
 	lic := &License{
-		KeyID:     opts.KeyID,
-		Licensee:  opts.Licensee,
-		FSUUID:    strings.TrimSpace(fsu),
-		PARTUUID:  strings.TrimSpace(pu),
-		USBSerial: strings.TrimSpace(usb),
-		IssuedAt:  time.Now().Unix(),
-	}
-	if opts.Label != "" {
-		// 라벨은 파일 시스템 라벨이라 update-only에선 보통 바꾸지 않음.
-		// 필요 시 여기서 mkfs 도구 없이 바꾸는 로직을 추가할 수 있음(플랫폼 의존).
+		KeyID:      opts.KeyID,
+		KeyVersion: AlgoVersionV1,
+		LicenseKey: makeLicenseKeyV1(strings.TrimSpace(fsu), strings.TrimSpace(pu), strings.TrimSpace(usb)),
+		Licensee:   strings.TrimSpace(opts.Licensee),
+		IssueDate:  time.Now().Format("2006/01/02"),
+		IssuedAt:   time.Now().Unix(),
 	}
 
 	if err := writeLicenseFiles(opts.MountPath, lic, priv); err != nil { return err }
@@ -285,6 +318,7 @@ func bakeISO(opts BakeOpts) error {
 	if opts.Readme != "" {
 		if err := copyFile(opts.Readme, filepath.Join(stage, "README.pdf")); err != nil { return fmt.Errorf("copy README: %w", err) }
 	}
+	// ISO는 fs/part UUID가 없으므로 레거시 형태 유지(USBSerial만)
 	lic := &License{ KeyID: opts.KeyID, Licensee: opts.Licensee, USBSerial: strings.TrimSpace(usbSerial), IssuedAt: time.Now().Unix() }
 	if err := writeLicenseFiles(stage, lic, priv); err != nil { return err }
 
@@ -361,10 +395,14 @@ func bakeFAT32(opts BakeOpts) error {
 		if err := copyFile(opts.Readme, filepath.Join(tmp, "README.pdf")); err != nil { return err }
 	}
 	priv, err := loadPrivKey(opts.PrivPath); if err != nil { return err }
+	// v1 포맷으로 기록
 	lic := &License{
-		KeyID: opts.KeyID, Licensee: opts.Licensee,
-		FSUUID: strings.TrimSpace(fsUUID), PARTUUID: strings.TrimSpace(partUUID),
-		USBSerial: strings.TrimSpace(usbSerial), IssuedAt: time.Now().Unix(),
+		KeyID:      opts.KeyID,
+		KeyVersion: AlgoVersionV1,
+		LicenseKey: makeLicenseKeyV1(strings.TrimSpace(fsUUID), strings.TrimSpace(partUUID), strings.TrimSpace(usbSerial)),
+		Licensee:   opts.Licensee,
+		IssueDate:  time.Now().Format("2006/01/02"),
+		IssuedAt:   time.Now().Unix(),
 	}
 	if err := writeLicenseFiles(tmp, lic, priv); err != nil { return err }
 	if err := exec.Command("bash", "-lc", fmt.Sprintf(`sudo cp -a "%s"/. "%s"/`, tmp, mnt)).Run(); err != nil { return err }
@@ -433,10 +471,14 @@ func bakeEXT4(opts BakeOpts) error {
 		if err := copyFile(opts.Readme, filepath.Join(tmp, "README.pdf")); err != nil { return err }
 	}
 	priv, err := loadPrivKey(opts.PrivPath); if err != nil { return err }
+	// v1 포맷으로 기록
 	lic := &License{
-		KeyID: opts.KeyID, Licensee: opts.Licensee,
-		FSUUID: strings.TrimSpace(fsUUID), PARTUUID: strings.TrimSpace(partUUID),
-		USBSerial: strings.TrimSpace(usbSerial), IssuedAt: time.Now().Unix(),
+		KeyID:      opts.KeyID,
+		KeyVersion: AlgoVersionV1,
+		LicenseKey: makeLicenseKeyV1(strings.TrimSpace(fsUUID), strings.TrimSpace(partUUID), strings.TrimSpace(usbSerial)),
+		Licensee:   opts.Licensee,
+		IssueDate:  time.Now().Format("2006/01/02"),
+		IssuedAt:   time.Now().Unix(),
 	}
 	if err := writeLicenseFiles(tmp, lic, priv); err != nil { return err }
 	if err := exec.Command("bash", "-lc", fmt.Sprintf(`sudo cp -a "%s"/. "%s"/`, tmp, mnt)).Run(); err != nil { return err }
@@ -487,27 +529,55 @@ func promptYN(r *bufio.Reader, label string, defNo bool) (bool, error) {
 
 
 type DevInfo struct {
-	Path string
-	Size string
+	Path  string
+	Size  string
 	Model string
 	Tran  string
+	Type  string
+	RM    string // "1" removable, "0" non-removable
 }
+
 func listCandidateDisks() ([]DevInfo, error) {
-	out, err := execCmd("lsblk", "-dn", "-o", "NAME,SIZE,MODEL,TRAN,TYPE")
+	// -P : key="val" 출력 → 공백/빈 문자열에도 안전
+	out, err := execCmd("lsblk", "-dn", "-o", "NAME,SIZE,MODEL,TRAN,TYPE,RM", "-P")
 	if err != nil { return nil, err }
+
+	parseKV := func(line string) map[string]string {
+		m := map[string]string{}
+		// 예: NAME="sdb" SIZE="59G" MODEL="" TRAN="usb" TYPE="disk" RM="1"
+		for _, tok := range strings.Fields(line) {
+			kv := strings.SplitN(tok, "=", 2)
+			if len(kv) != 2 { continue }
+			key := kv[0]
+			val := strings.Trim(kv[1], `"`)
+			m[key] = val
+		}
+		return m
+	}
+
 	var res []DevInfo
 	for _, ln := range strings.Split(out, "\n") {
-		if strings.TrimSpace(ln) == "" { continue }
-		fields := strings.Fields(ln)
-		if len(fields) < 5 { continue }
-		name, size, typ := fields[0], fields[1], fields[len(fields)-1]
-		if typ != "disk" { continue }
-		tran := fields[len(fields)-2]
-		model := strings.Join(fields[2:len(fields)-2], " ")
-		res = append(res, DevInfo{Path: "/dev/" + name, Size: size, Model: model, Tran: tran})
+		ln = strings.TrimSpace(ln)
+		if ln == "" { continue }
+		kv := parseKV(ln)
+		if kv["TYPE"] != "disk" { continue }
+
+		name := kv["NAME"]
+		if name == "" { continue }
+
+		di := DevInfo{
+			Path:  "/dev/" + name,
+			Size:  kv["SIZE"],
+			Model: kv["MODEL"],        // 빈 문자열이어도 OK
+			Tran:  kv["TRAN"],         // 빈 문자열이어도 OK
+			Type:  kv["TYPE"],
+			RM:    kv["RM"],
+		}
+		res = append(res, di)
 	}
 	return res, nil
 }
+
 
 func interactiveBake(base BakeOpts) (BakeOpts, error) {
 	r := bufio.NewReader(os.Stdin)
@@ -575,8 +645,14 @@ func interactiveBake(base BakeOpts) (BakeOpts, error) {
 		fmt.Println("Select target disk:")
 		for i, d := range list {
 			tag := ""
-			if strings.EqualFold(d.Tran, "usb") { tag = " [USB]" }
-			fmt.Printf("  [%d] %s  %s  %s%s\n", i, d.Path, d.Size, d.Model, tag)
+			if strings.EqualFold(d.Tran, "usb") || d.RM == "1" {
+				tag = " [USB]"
+			}
+			model := d.Model
+			if strings.TrimSpace(model) == "" {
+				model = "(no-model)"
+			}
+			fmt.Printf("  [%d] %s  %s  %s%s\n", i, d.Path, d.Size, model, tag)
 		}
 		for {
 			iv, err := prompt(r, "Enter number", "0"); if err != nil { return opts, err }
