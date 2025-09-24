@@ -226,10 +226,13 @@ func cmdBakeInteractive() {
 /* =========================
    verify (서명 + serial_key 비교)
    ========================= */
+// --- replace cmdVerify() with this version ---
+// --- replace cmdVerify() with this version ---
 func cmdVerify() {
 	fs := flag.NewFlagSet("verify", flag.ExitOnError)
-	mount := fs.String("mount", "", "mount point")
-	pub := fs.String("pub", "", "Ed25519 public key PEM")
+	mount  := fs.String("mount", "", "mount point")
+	pub    := fs.String("pub",   "", "Ed25519 public key PEM")
+	detail := fs.Bool("detail",  false, "show device snapshot and calculated keys")
 	_ = fs.Parse(os.Args[2:])
 	if *mount == "" || *pub == "" {
 		fs.Usage()
@@ -251,17 +254,40 @@ func cmdVerify() {
 	}
 	fmt.Println("signature: OK")
 
-	// 3) serial_key 비교 (장치/바인딩 노출 없음)
+	// 3) 라이선스 파싱
 	var lic License
 	must(json.Unmarshal(licBytes, &lic))
 
+	// 4) 로컬 바인딩 계산
 	dev, err := devFromMount(*mount)
 	must(err)
 	info, err := collectBindingInfo(dev)
 	must(err)
-	localBinding := buildBindingKeyV1(info)
-	localSerial := sha256Hex(localBinding + "|" + lic.IssuedAt.UTC().Format(time.RFC3339))
 
+	// 여분 개행/스페이스 제거 (중복 출력 방지)
+	info.FsUUID        = strings.TrimSpace(info.FsUUID)
+	info.PartUUID      = strings.TrimSpace(info.PartUUID)
+	info.PTUUID        = strings.TrimSpace(info.PTUUID)
+	info.USBSerialFull = strings.TrimSpace(info.USBSerialFull)
+
+	localBinding := buildBindingKeyV1(info)
+	localSerial  := sha256Hex(localBinding + "|" + lic.IssuedAt.UTC().Format(time.RFC3339))
+
+	// 5) detail 출력 (관리자용)
+	if *detail {
+		fmt.Println("device snapshot (admin view):")
+		if info.FsUUID != ""        { fmt.Printf("  fs_uuid        = %s\n", info.FsUUID) }
+		if info.PartUUID != ""      { fmt.Printf("  partuuid       = %s\n", info.PartUUID) }
+		if info.PTUUID != ""        { fmt.Printf("  ptuuid         = %s\n", info.PTUUID) }
+		if info.USBSerialFull != "" { fmt.Printf("  usb_serial     = %s\n", info.USBSerialFull) }
+
+		fmt.Println("calculated keys:")
+		fmt.Printf("  issued_at              = %s\n", lic.IssuedAt.UTC().Format(time.RFC3339))
+		fmt.Printf("  serial_key (license)   = %s\n", lic.SerialKey)
+		fmt.Printf("  serial_key (local)     = %s\n", localSerial)
+	}
+
+	// 6) 결과
 	if subtleConstTimeEq(localSerial, lic.SerialKey) {
 		fmt.Println("verify: serial_key match (OK)")
 	} else {
@@ -396,23 +422,26 @@ func collectBindingInfo(devPart string) (DeviceSnapshot, error) {
 
 	// FS UUID, PARTUUID, PKNAME(부모 디스크 이름)
 	uout, err := exec.Command("lsblk", "-no", "UUID,PARTUUID,PKNAME", devPart).Output()
+	fs := strings.Fields(string(uout))
 	if err != nil {
 		return d, err
 	}
-	fields := fieldsNoEmpty(string(uout))
-	if len(fields) > 0 {
-		d.FsUUID = strings.ToUpper(strings.TrimSpace(fields[0]))
+	if len(fs) > 0 {
+		d.FsUUID = strings.ToUpper(strings.TrimSpace(fs[0]))
 	}
-	if len(fields) > 1 {
-		d.PartUUID = strings.ToLower(strings.TrimSpace(fields[1]))
+	if len(fs) > 1 {
+		d.PartUUID = strings.ToLower(strings.TrimSpace(fs[1]))
 	}
 	parent := ""
-	if len(fields) > 2 {
-		parent = strings.TrimSpace(fields[2])
+	if len(fs) > 2 {
+		parent = strings.TrimSpace(fs[2])
 	}
 	if parent != "" {
 		pout, _ := exec.Command("lsblk", "-no", "PTUUID", "/dev/"+parent).Output()
-		d.PTUUID = strings.ToLower(strings.TrimSpace(string(pout)))
+		pt := strings.Fields(string(pout))
+		if len(pt) > 0 {
+			d.PTUUID = strings.ToLower(strings.TrimSpace(pt[0]))
+		}
 	}
 
 	// udev props
