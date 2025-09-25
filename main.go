@@ -223,10 +223,26 @@ func cmdBakeInteractive() {
 	}
 }
 
+const issuedLabelWidth = 22
+
+func printIssuedUTCandKST(label string, t time.Time){
+	// UTC/KST 문자열
+	utc := t.UTC().Format(time.RFC3339)
+	loc, _ := time.LoadLocation("Asia/Seoul")
+	kst := t.In(loc).Format(time.RFC3339)
+
+	fmt.Printf("  %-*s = UTC %s\n", issuedLabelWidth, label, utc)
+
+// 2nd line
+// indent space = "  " + 22 " 
+indent := strings.Repeat(" ", 27)
+	fmt.Printf("%sKST %s\n", indent, kst)
+
+}
+
 /* =========================
    verify (서명 + serial_key 비교)
    ========================= */
-// --- replace cmdVerify() with this version ---
 // --- replace cmdVerify() with this version ---
 func cmdVerify() {
 	fs := flag.NewFlagSet("verify", flag.ExitOnError)
@@ -282,7 +298,8 @@ func cmdVerify() {
 		if info.USBSerialFull != "" { fmt.Printf("  usb_serial     = %s\n", info.USBSerialFull) }
 
 		fmt.Println("calculated keys:")
-		fmt.Printf("  issued_at              = %s\n", lic.IssuedAt.UTC().Format(time.RFC3339))
+		// fmt.Printf("  issued_at              = %s\n", lic.IssuedAt.UTC().Format(time.RFC3339))
+		printIssuedUTCandKST("issued_at", lic.IssuedAt)
 		fmt.Printf("  serial_key (license)   = %s\n", lic.SerialKey)
 		fmt.Printf("  serial_key (local)     = %s\n", localSerial)
 	}
