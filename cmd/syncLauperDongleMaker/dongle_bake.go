@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"syncLauperDongleMaker/internal/config"
 	"syncLauperDongleMaker/internal/binding"
 	"syncLauperDongleMaker/internal/disk"
 	"syncLauperDongleMaker/internal/keys"
@@ -29,7 +30,7 @@ func cmdDongleBake() {
 	device    := fs.String("device", "", "target disk device (e.g. /dev/sdX)")
 	label     := fs.String("label",  labelName, "FAT32 volume label")
 	licensee  := fs.String("licensee", "", "licensee name")
-	privPath  := fs.String("priv",     privPathFix, "Ed25519 private key (PKCS#8 PEM)")
+	privPath  := fs.String("priv",     config.ProvPrivDefault, "Ed25519 private key (PKCS#8 PEM)")
 	readme    := fs.String("readme",   "", "optional README.pdf to copy to the dongle")
 	yes       := fs.Bool("yes", false, "non-interactive; proceed without prompt")
 	preview   := fs.Bool("preview", false, "only show what will run (no write)")

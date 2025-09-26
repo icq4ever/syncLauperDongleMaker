@@ -11,6 +11,7 @@ import (
 	"time"
 	"strings"
 
+	"syncLauperDongleMaker/internal/config"
 	"syncLauperDongleMaker/internal/binding"
 	"syncLauperDongleMaker/internal/disk"
 	"syncLauperDongleMaker/internal/keys"
@@ -19,16 +20,12 @@ import (
 	"syncLauperDongleMaker/internal/device"
 )
 
-// main.go의 switch에서:
-// case "verify":
-//     cmdDongleVerify()
-
 func cmdDongleVerify() {
 	fs := flag.NewFlagSet("verify", flag.ExitOnError)
 
 	mount   := fs.String("mount", "", "mount point of the dongle (e.g. /media/usb)")
 	devFlag  := fs.String("device","", "device/partition (e.g. /dev/sdX1); overrides --mount if set")
-	pubPath := fs.String("pub",   "", "Ed25519 public key PEM (PKIX)")
+	pubPath := fs.String("pub",   config.ProvPubDefault, "Ed25519 public key PEM (PKIX)")
 	detail  := fs.Bool("detail",  false, "show device snapshot and calculated keys")
 	jsonOut := fs.Bool("json",    false, "print result as JSON")
 	_ = fs.Parse(os.Args[2:])

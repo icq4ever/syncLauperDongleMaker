@@ -8,6 +8,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+
+	"syncLauperDongleMaker/internal/config"
 )
 
 /* =========================
@@ -15,9 +17,20 @@ import (
    ========================= */
 func cmdKeygen() {
 	fs := flag.NewFlagSet("keygen", flag.ExitOnError)
-	outPriv := fs.String("out-priv", "privkey.pem", "Ed25519 private key PEM (PKCS#8)")
-	outPub := fs.String("out-pub", "pubkey.pem", "Ed25519 public key PEM (PKIX)")
+	kind := fs.String("kind", "prov", "which pair to generate: prov/issuer")
+	outPriv := fs.String("out-priv", config.ProvPrivDefault, "Ed25519 private key PEM (PKCS#8)")
+	outPub := fs.String("out-pub", config.ProvPubDefault, "Ed25519 public key PEM (PKIX)")
+
 	_ = fs.Parse(os.Args[2:])
+
+	// 어떤 플래그가 실제로 전달되었는지 기록
+	seen := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) {seen[f.Name] = true})
+
+	if *kind == "issuer" {
+		if !seen["out-priv"] { *outPriv = config.IssuerPrivDefault }
+		if !seen["out-pub"]  { *outPub  = config.IssuerPubDefault  }
+	}
 
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	must(err)
