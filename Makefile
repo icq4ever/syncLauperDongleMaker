@@ -1,4 +1,14 @@
-# ==== Paths ====
+# ===== Linux-only Makefile with safety checks =====
+
+# ---- OS guard (Linux only) ----
+OS := $(shell uname -s)
+ifeq ($(OS),Linux)
+# ok
+else
+$(error This Makefile is Linux-only)
+endif
+
+# ---- Paths ----
 BIN_DIR := bin
 APP     := $(BIN_DIR)/syncLauperDongleMaker
 
@@ -7,18 +17,31 @@ PROV_DIR := $(KEY_ROOT)/provisioning
 RP_DIR   := $(KEY_ROOT)/rp
 ART_DIR  := $(BIN_DIR)/artifacts
 
-# ==== Defaults for run targets (override at call time) ====
+# ---- Defaults for run targets (override at call time) ----
 DEVICE   ?= /dev/sdX
 MOUNT    ?= /media/usb
 LICENSEE ?= ACME Inc.
 README   ?=
 YES      ?= --yes
-PRIV     ?= keys/provisioning/privkey.pem   # bin을 CWD로 잡으므로 keys/...가 bin/keys/...를 가리킴
+PRIV     ?= keys/provisioning/privkey.pem   # CWD=bin 기준 → bin/keys/...
 PUB      ?= keys/provisioning/pubkey.pem
 PORT     ?= /dev/ttyACM0
 
-.PHONY: all build rebuild run run-bake run-verify run-probe keygen-prov keygen-rp sanity clean help
+# ---- Required Linux utilities (sanity/probe/bake rely on these) ----
+REQUIRED := losetup sfdisk mkfs.vfat mount udevadm lsblk parted
+
+.PHONY: all build rebuild run run-bake run-verify run-probe \
+        keygen-prov keygen-rp sanity clean help check-deps
+
 all: build
+
+## Check required CLI tools exist (Linux)
+check-deps:
+	@ok=1; \
+	for c in $(REQUIRED); do \
+		if ! command -v $$c >/dev/null 2>&1; then echo "missing: $$c"; ok=0; fi; \
+	done; \
+	[ $$ok -eq 1 ] || (echo "Install the missing tools and retry."; exit 1)
 
 ## Build binary to bin/
 build:
@@ -26,17 +49,17 @@ build:
 	@go build -o $(APP) ./cmd/syncLauperDongleMaker
 	@echo "built: $(APP)"
 
-## Rebuild from scratch
+## Clean cache & rebuild
 rebuild:
 	@go clean -cache
 	@$(MAKE) -s clean
 	@$(MAKE) -s build
 
-## Quick run (prints usage)
+## Show usage (runs binary with -h)
 run: build
 	@cd $(BIN_DIR) && ./$(notdir $(APP)) -h || true
 
-## Bake USB (DEVICE, LICENSEE, PRIV, README, YES)
+## Bake USB (override DEVICE, LICENSEE, PRIV, README, YES)
 run-bake: build
 	@mkdir -p $(PROV_DIR)
 	@cd $(BIN_DIR) && ./$(notdir $(APP)) bake \
@@ -46,7 +69,7 @@ run-bake: build
 		$(if $(README),--readme "$(README)",) \
 		$(YES)
 
-## Verify USB (MOUNT, PUB)
+## Verify USB (override MOUNT, PUB)
 run-verify: build
 	@cd $(BIN_DIR) && ./$(notdir $(APP)) verify \
 		--mount "$(MOUNT)" \
@@ -84,8 +107,8 @@ keygen-rp: build
 	@chmod 600 $(RP_DIR)/privkey.pem
 	@echo "keys: $(RP_DIR)/{privkey.pem,pubkey.pem}"
 
-## E2E sanity via loopback (Linux; requires sudo, mkfs.vfat, losetup)
-sanity: build
+## Linux E2E sanity via loopback (requires sudo + check-deps)
+sanity: check-deps build
 	@mkdir -p $(ART_DIR) $(PROV_DIR)
 	@bash -eu -o pipefail -c '\
 		IMG=$$(mktemp $(ART_DIR)/dongle-XXXX.img); \
@@ -117,5 +140,5 @@ help:
 	@echo "  run-probe     - Probe (uses DEVICE/MOUNT/PORT)"
 	@echo "  keygen-prov   - Generate provisioning keypair in $(PROV_DIR)"
 	@echo "  keygen-rp     - Generate RP keypair in $(RP_DIR)"
-	@echo "  sanity        - Loopback end-to-end test (Linux)"
+	@echo "  sanity        - Loopback end-to-end test (Linux, checks deps)"
 	@echo "  clean         - Remove bin"
