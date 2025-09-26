@@ -1,8 +1,10 @@
 package utils
 
 import(
+	"fmt"
 	"strings"
 	"os"
+	"time"
 )
 
 func ParseKVEq(s string) map[string]string {
@@ -38,4 +40,25 @@ func CopyFile(src, dst string) error {
 		return err
 	}
 	return out.Sync()
+}
+
+
+const issuedLabelWidth = 22
+
+// PrintIssuedUTCandKST prints "label = UTC ..." on one line and "KST ..." on the next line, nicely aligned.
+func PrintIssuedUTCandKST(label string, t time.Time) {
+	utc := t.UTC().Format(time.RFC3339)
+
+	// Try Asia/Seoul; fall back to local if load fails
+	loc, err := time.LoadLocation("Asia/Seoul")
+	if err != nil {
+		loc = time.Local
+	}
+	kst := t.In(loc).Format(time.RFC3339)
+
+	// first line
+	fmt.Printf("  %-*s = UTC %s\n", issuedLabelWidth, label, utc)
+	// second line (indent = "  " + issuedLabelWidth + " = ")
+	indent := "  " + fmt.Sprintf("%-*s", issuedLabelWidth, "") + "   "
+	fmt.Printf("%sKST %s\n", indent, kst)
 }

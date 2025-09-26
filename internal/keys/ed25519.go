@@ -63,3 +63,14 @@ func LoadEd25519PubFromPEM(path string) (ed25519.PublicKey, error) {
 	}
 	return nil, errors.New("no Ed25519 public key found in PEM")
 }
+
+
+// SignEd25519 signs msg with the Ed25519 private key.
+func SignEd25519(priv ed25519.PrivateKey, msg []byte) []byte {
+	return ed25519.Sign(priv, msg)
+}
+
+// VerifyEd25519 verifies sig over msg with the Ed25519 public key.
+func VerifyEd25519(pub ed25519.PublicKey, msg, sig []byte) bool {
+	return ed25519.Verify(pub, msg, sig)
+}

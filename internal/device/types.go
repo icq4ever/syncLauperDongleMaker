@@ -1,11 +1,11 @@
 package device
 
-// 공통 스냅샷
+/* ===== 내부 전용 (노출 금지) ===== */
 type Snapshot struct {
-	FsUUID        string
-	PartUUID      string
-	PTUUID        string
-	USBSerialFull string
+	FsUUID        string // UPPER
+	PartUUID      string // lower
+	PTUUID        string // lower (parent disk PTUUID)
+	USBSerialFull string // UPPER (ID_SERIAL), fallback SHORT
 }
 
 // 각 백엔드가 “스냅샷을 제공”

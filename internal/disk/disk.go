@@ -5,7 +5,19 @@ import(
 	"fmt"
 	"os/exec"
 	"strings"
+
+	"syncLauperDongleMaker/internal/device"
 )
+
+type Inspector struct{
+	PartDev string
+}
+
+func (i Inspector) Snapshot() (device.Snapshot, error) {
+	var s device.Snapshot
+	// lsblk/udevadm으로 s 채우는 기존 로직
+	return s, nil
+}
 
 // 전체 포맷(FAT32) : 단일 파티션 + 라벨
 func FormatFAT32SinglePartition(disk, label string) error {

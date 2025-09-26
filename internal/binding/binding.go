@@ -5,22 +5,11 @@ import(
 	"strings"
 
 	"syncLauperDongleMaker/internal/utils"
+	"syncLauperDongleMaker/internal/device"
 )
 
-/* =========================
-   Device / Binding (internal only)
-   ========================= */
-
-/* ===== 내부 전용 (노출 금지) ===== */
-type DeviceSnapshot struct {
-	FsUUID        string // UPPER
-	PartUUID      string // lower
-	PTUUID        string // lower (parent disk PTUUID)
-	USBSerialFull string // UPPER (ID_SERIAL), fallback SHORT
-}
-
-func CollectBindingInfo(devPart string) (DeviceSnapshot, error) {
-	var d DeviceSnapshot
+func CollectBindingInfo(devPart string) (device.Snapshot, error) {
+	var d device.Snapshot
 
 	// FS UUID, PARTUUID, PKNAME(부모 디스크 이름)
 	uout, err := exec.Command("lsblk", "-no", "UUID,PARTUUID,PKNAME", devPart).Output()
@@ -57,7 +46,7 @@ func CollectBindingInfo(devPart string) (DeviceSnapshot, error) {
 }
 
 // 바인딩: UUID 3종 + 컨트롤러 시리얼(Full)
-func BuildKeyV1(d DeviceSnapshot) string {
+func BuildKeyV1(d device.Snapshot) string {
 	return strings.Join([]string{
 		strings.ToUpper(d.FsUUID),
 		strings.ToLower(d.PartUUID),
