@@ -1,3 +1,8 @@
+/bin/
+
+
+!bin/scripts/
+!bin/scripts/**
+!bin/README.md
+
 *.pem
-/syncLauperDongleMaker
-/syncLauperDongleMaker.exe
