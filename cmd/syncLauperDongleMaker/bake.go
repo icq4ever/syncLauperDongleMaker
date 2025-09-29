@@ -62,12 +62,14 @@ func cmdBakeInteractive() {
 	fmt.Printf("  Label=%s\n", labelName)
 	fmt.Printf("  Licensee=%s\n", licensee)
 	fmt.Printf("  Priv=%s\n", privPathFix)
+
 	if readmePath != "" {
 		fmt.Printf("  README=%s\n", readmePath)
 	} else {
 		fmt.Printf("  README=\n")
 	}
 	fmt.Print("Proceed? (y/N): ")
+	
 	resp := strings.ToLower(strings.TrimSpace(readLine(reader)))
 	if resp != "y" && resp != "yes" {
 		fatal("aborted by user")

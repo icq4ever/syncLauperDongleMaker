@@ -30,6 +30,8 @@ func main() {
     if err := interactiveProbe(); err != nil {
 			fatal("probe: %v", err)
     }
+	case "upload":
+		cmdProvision(os.Args[2:])
 	default:
 		usage()
 	}

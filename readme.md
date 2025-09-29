@@ -41,3 +41,36 @@ sudo ./syncLauperDongleMaker bake --update-only --mount /media/dongle \
 ```
 ./syncLauperDongleMaker verify --mount /media/dongle --pub pubkey.pem
 ```
+
+
+# CLI structure
+```
+syncLauperDongleMaker
+├─ probe            # 1. USB/RP 식별자 확인 (공통)
+│   ├─ --device /dev/sdX | --mount /media/usb | --port /dev/ttyACM0
+│   ├─ --json      # JSON 출력(툴/스크립트 연동용)
+│   └─ --detail
+│
+├─ dongle          # 2. USB 동글 (디스크 기반)
+│   ├─ bake        # a. 발급/구움(대화형/비대화형)
+│   │   ├─ --device /dev/sdX (or interactive)
+│   │   ├─ --label SL-DONGLE
+│   │   ├─ --licensee "ACME Inc."
+│   │   ├─ --priv privkey.pem
+│   │   ├─ --readme README.pdf
+│   │   └─ --yes   # 비대화형 진행
+│   └─ verify      # b. 검증
+│       ├─ --mount /media/usb
+│       ├─ --pub pubkey.pem
+│       └─ --detail
+│
+└─ rp              # 3. RP 동글모드 (MSC/CDC)
+    ├─ bake        # a. RP에 라이선스 씌우기
+    │   ├─ --port /dev/ttyACM0
+    │   ├─ --priv privkey.pem
+    │   └─ (옵션) --msc   # MSC 모드에서 직접 파일쓰기 가능 시
+    └─ verify      # b. RP 동글 검증
+        ├─ --port /dev/ttyACM0
+        ├─ --pub pubkey.pem
+        └─ --detail
+```
