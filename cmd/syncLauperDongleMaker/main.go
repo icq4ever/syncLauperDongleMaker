@@ -41,8 +41,8 @@ func usage() {
 	prog := filepath.Base(os.Args[0])
 	fmt.Fprintf(os.Stderr, `Usage:
   %s keygen --out-priv privkey.pem --out-pub pubkey.pem
-  %s bake        # 대화형 발급: 포맷(FAT32), 라벨=SL-DONGLE, privkey.pem 고정, device/binding 미노출
+  %s bake   # 대화형 발급: 포맷(FAT32), 라벨=SL-DONGLE, privkey.pem 고정, device/binding 미노출
   %s verify --mount /path --pub pubkey.pem
-	%s probe       # 대화형: USB 디스크 리스트 → 번호 선택 → 식별자 일괄 표시
+  %s probe  # 대화형: USB 디스크 리스트 → 번호 선택 → 식별자 일괄 표시
 `, prog, prog, prog, prog)
 }
