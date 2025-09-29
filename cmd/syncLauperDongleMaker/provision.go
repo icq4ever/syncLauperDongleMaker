@@ -110,7 +110,7 @@ func cmdProvision(args []string) {
 			lc = strings.TrimSpace(readLineWithDuration(in))
 			if lc == "" { fmt.Println("  (required)") }
 		}
-		issued := time.Now().UTC().Format("2006-01-02T15:04:05.000000000Z07:00")
+		issued := time.Now().UTC().Format(time.RFC3339Nano)
 		serial := sha256Hex(uid + "|" + issued)
 
 		// v2: issued_at은 문자열(나노초 9자리), compact JSON(서명 바이트 안정)
@@ -153,13 +153,46 @@ func cmdProvision(args []string) {
 		}
 	}
 
-	// ===== 4) ENTER-PROV (IssuerPriv로 서명) =====
-	nonce := randomNonceHex(12)
+	// ===== 4) CHALLENGE-RESPONSE: request device nonce (REQ-PROV) and sign it =====
+	// Ask device to produce a nonce (device-side TRNG) and return "CHAL <noncehex>"
+	writeLine(s, "REQ-PROV")
+
+	// waitFor handles DBG: lines (it prints them as [DEV] ...), and will return a line
+	// that equals or starts with "CHAL" (because we pass "CHAL" as a want).
+	chalLine, err := waitFor(br, 5*time.Second, "CHAL")
+	if err != nil {
+		die("REQ-PROV: %v", err)
+	}
+	// chalLine is expected like "CHAL 3A2FFED6..."
+	// extract nonce after the space
+	var nonce string
+	if strings.HasPrefix(chalLine, "CHAL ") {
+		nonce = strings.TrimSpace(chalLine[len("CHAL "):])
+	} else if strings.HasPrefix(chalLine, "CHAL\t") {
+		nonce = strings.TrimSpace(chalLine[len("CHAL\t"):])
+	} else {
+		// defensive: if waitFor matched via prefix, the line might be exactly "CHAL" (no nonce)
+		// treat that as error
+		die("REQ-PROV: unexpected CHAL format: %q", chalLine)
+	}
+	if nonce == "" {
+		die("REQ-PROV: empty nonce")
+	}
+	// optional: sanity-check nonce length (hex). permit flexible length.
+	if len(nonce) > 256 {
+		die("REQ-PROV: nonce too long")
+	}
+
+	// Build the message the device expects and sign with issuer private key.
+	// NOTE: device constructs the same msg = nonce + "|" + UID + "|ENTER-PROV"
 	msg := nonce + "|" + uid + "|ENTER-PROV"
+
+	// load issuer private key (host-side). This is the key whose pubkey/device has in OTP.
 	privIssuer := mustLoadPriv(*issuerPriv)
 	sigAuth := ed25519.Sign(privIssuer, []byte(msg))
 	sigAuthB64 := base64.StdEncoding.EncodeToString(sigAuth)
 
+	// send ENTER-PROV <nonce> <sigB64>
 	writeLine(s, "ENTER-PROV "+nonce+" "+sigAuthB64)
 	if err := expectOK(br); err != nil { die("ENTER-PROV: %v", err) }
 
