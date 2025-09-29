@@ -73,7 +73,7 @@ func cmdDongleVerify() {
 	snap.USBSerialFull = strings.ToUpper(strings.TrimSpace(snap.USBSerialFull))
 
 	localBinding := binding.BuildKeyV1(snap)
-	localSerial  := utils.Sha256Hex(localBinding + "|" + lic.IssuedAt.UTC().Format(time.RFC3339))
+	localSerial  := utils.Sha256Hex(localBinding + "|" + lic.IssuedAt.UTC().Format(time.RFC3339Nano))
 
 	// 6) detail 출력
 	if *detail {
