@@ -110,7 +110,7 @@ func cmdProvision(args []string) {
 			lc = strings.TrimSpace(readLineWithDuration(in))
 			if lc == "" { fmt.Println("  (required)") }
 		}
-		issued := time.Now().UTC().Format(time.RFC3339Nano)
+		issued := time.Now().UTC().Format(time.RFC3339Nano) // 나노초 9자리
 		serial := sha256Hex(uid + "|" + issued)
 
 		// v2: issued_at은 문자열(나노초 9자리), compact JSON(서명 바이트 안정)
