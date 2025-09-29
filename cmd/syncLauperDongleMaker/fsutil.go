@@ -97,3 +97,26 @@ func pickTargetDiskByIndex(reader *bufio.Reader) (string, string) {
 	preview := fmt.Sprintf("  Selected: %s", cands[idx].line)
 	return cands[idx].path, preview
 }
+
+
+/* =========================
+   DOS Read-only helper (디바이스 지정 + 폴백 chmod)
+   ========================= */
+
+func setDOSReadOnlyOnDevice(partDev, dosPath, mountedPath string) error {
+	// 1) mtools: mattrib +r -i <device> ::/path
+	if _, err := exec.LookPath("mattrib"); err == nil {
+		if err := exec.Command("mattrib", "+r", "-i", partDev, dosPath).Run(); err == nil {
+			return nil
+		}
+	}
+	// 2) fatattr (일부 배포판)
+	if _, err := exec.LookPath("fatattr"); err == nil {
+		if err := exec.Command("fatattr", "+r", mountedPath).Run(); err == nil {
+			return nil
+		}
+	}
+	// 3) fallback: 권한 쓰기 제거 (vfat에서 DOS R 비트로 매핑되는 경우가 많음)
+	_ = exec.Command("chmod", "a-w", mountedPath).Run()
+	return nil
+}
