@@ -226,29 +226,61 @@ func expectRebooting(r *bufio.Reader) error {
 // expectRebootOrDisconnect waits for OK:REBOOTING or device disconnect (portPath disappears).
 func expectRebootOrDisconnect(br *bufio.Reader, portPath string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	consecutiveEmptyReads := 0
+	sawOK := false
+
 	for time.Now().Before(deadline) {
 		l := strings.TrimSpace(readLineWithDuration(br, 2*time.Second))
+
 		if l == "" {
-			// check if port file disappeared (re-enumeration)
-			if _, err := os.Stat(portPath); os.IsNotExist(err) {
-				return nil
+			consecutiveEmptyReads++
+			// After multiple empty reads, assume device disconnected
+			if consecutiveEmptyReads >= 3 {
+				// check if port file disappeared (re-enumeration)
+				if _, err := os.Stat(portPath); os.IsNotExist(err) {
+					fmt.Println("Device disconnected (port disappeared)")
+					return nil
+				}
+				// Port still exists but no data - if we already saw OK, consider it success
+				if sawOK {
+					fmt.Println("Device disconnected (saw OK, now silent)")
+					return nil
+				}
 			}
 			continue
 		}
+
+		// Reset counter on successful read
+		consecutiveEmptyReads = 0
+
 		if strings.HasPrefix(l, "DBG:") {
 			fmt.Println("[DEV]", l)
 			continue
 		}
+
 		if l == "OK" || strings.HasPrefix(l, "OK:REBOOTING") || strings.HasPrefix(l, "OK:") {
-			return nil
+			fmt.Println("Got OK response, waiting for device reconnection...")
+			sawOK = true
+			// Don't return immediately, wait a bit for disconnect
+			continue
 		}
+
 		if strings.HasPrefix(l, "ERR:") {
 			return fmt.Errorf("%s", strings.TrimPrefix(l, "ERR:"))
 		}
 	}
+
 	// final check: port gone -> success
 	if _, err := os.Stat(portPath); os.IsNotExist(err) {
+		fmt.Println("Device disconnected (timeout but port gone)")
 		return nil
 	}
+
+	// If we saw OK but timeout, consider it success (device may have rebooted)
+	if sawOK {
+		fmt.Println("Device likely rebooted (saw OK)")
+		return nil
+	}
+
 	return fmt.Errorf("timeout waiting for OK or device disconnect")
 }

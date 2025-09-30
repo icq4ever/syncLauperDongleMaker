@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -102,7 +103,15 @@ func cmdProvision(args []string) {
 		lc := strings.TrimSpace(*licensee)
 		for lc == "" {
 			fmt.Print("Licensee: ")
-			lc = strings.TrimSpace(readLineWithDuration(in))
+			// Use standard ReadString instead of readLineWithDuration for stdin
+			line, err := in.ReadString('\n')
+			if err != nil {
+				if err == io.EOF {
+						break
+				}
+				continue
+			}
+			lc = strings.TrimSpace(line)
 			if lc == "" {
 				fmt.Println("  (required)")
 			}
@@ -249,8 +258,8 @@ func cmdProvision(args []string) {
 	}
 
 	writeLine(s, "COMMIT")
-	if err := expectRebootOrDisconnect(br, p, 12*time.Second); err != nil {
-    fatal("COMMIT: %v", err)
+	if err := expectRebootOrDisconnect(br, p, 20*time.Second); err != nil {
+		fatal("COMMIT: %v", err)
 	}
 
 	// 6) local backup
