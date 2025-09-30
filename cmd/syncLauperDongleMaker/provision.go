@@ -147,7 +147,7 @@ func cmdBurn(args []string) {
 			SerialKey:   serial,
 		}
 		var err error
-		licBytes, err = json.Marshal(lic)
+		licBytes, err = json.MarshalIndent(lic, "", "  ")
 		if err != nil {
 			fatal("marshal license: %v", err)
 		}
