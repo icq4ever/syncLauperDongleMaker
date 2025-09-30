@@ -149,8 +149,7 @@ func cmdDongleBake() {
 	issued := time.Now().UTC()
 	bindingKey := binding.BuildKeyV1(snap)
 
-	// serial_key = SHA256(binding || "|" || issued_at_RFC3339)
-	serialKey := utils.Sha256Hex(bindingKey + "|" + issued.Format(time.RFC3339Nano))
+	serialKey := utils.Sha256Hex(bindingKey + "|" + issued.Format(time.RFC3339))
 
 	// license.json
 	lic := licmodel.License{
