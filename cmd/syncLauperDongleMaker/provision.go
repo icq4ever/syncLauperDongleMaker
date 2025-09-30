@@ -107,7 +107,7 @@ func cmdProvision(args []string) {
 				fmt.Println("  (required)")
 			}
 		}
-		issued := time.Now().UTC().Format(time.RFC3339Nano)
+		issued := time.Now().UTC().Format(time.RFC3339)
 		serial := sha256Hex(uid + "|" + issued)
 
 		lic := struct {
