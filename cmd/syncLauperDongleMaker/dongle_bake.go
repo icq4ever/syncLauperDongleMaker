@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"syncLauperDongleMaker/internal/config"
 	"syncLauperDongleMaker/internal/binding"
+	"syncLauperDongleMaker/internal/config"
 	"syncLauperDongleMaker/internal/disk"
 	"syncLauperDongleMaker/internal/keys"
 	"syncLauperDongleMaker/internal/licmodel"
@@ -21,19 +21,19 @@ import (
 )
 
 // main.go 스위치:
-// case "bake":
-//     cmdDongleBake()
+// case "usb":
+//     cmdUSB()
 
-func cmdDongleBake() {
-	fs := flag.NewFlagSet("bake", flag.ExitOnError)
+func cmdUSB() {
+	fs := flag.NewFlagSet("usb", flag.ExitOnError)
 
-	device    := fs.String("device", "", "target disk device (e.g. /dev/sdX)")
-	label     := fs.String("label",  labelName, "FAT32 volume label")
-	licensee  := fs.String("licensee", "", "licensee name")
-	privPath  := fs.String("priv",     config.ProvPrivDefault, "Ed25519 private key (PKCS#8 PEM)")
-	readme    := fs.String("readme",   "", "optional README.pdf to copy to the dongle")
-	yes       := fs.Bool("yes", false, "non-interactive; proceed without prompt")
-	preview   := fs.Bool("preview", false, "only show what will run (no write)")
+	device := fs.String("device", "", "target disk device (e.g. /dev/sdX)")
+	label := fs.String("label", labelName, "FAT32 volume label")
+	licensee := fs.String("licensee", "", "licensee name")
+	privPath := fs.String("priv", config.ProvPrivDefault, "Ed25519 private key (PKCS#8 PEM)")
+	readme := fs.String("readme", "", "optional README.pdf to copy to the dongle")
+	yes := fs.Bool("yes", false, "non-interactive; proceed without prompt")
+	preview := fs.Bool("preview", false, "only show what will run (no write)")
 	_ = fs.Parse(os.Args[2:])
 
 	// 0) Private key 존재 확인
@@ -59,7 +59,7 @@ func cmdDongleBake() {
 		}
 	}
 
-// 0.2) README 포함 여부 확인 (대화형 전용)
+	// 0.2) README 포함 여부 확인 (대화형 전용)
 	if !*yes && strings.TrimSpace(*readme) == "" {
 		r := newLineReader()
 		fmt.Print("Add README.pdf? (y/N): ")

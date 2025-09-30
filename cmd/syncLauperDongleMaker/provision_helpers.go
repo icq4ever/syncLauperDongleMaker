@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"syncLauperDongleMaker/internal/device"
 	"syncLauperDongleMaker/internal/keys"
 
 	"github.com/tarm/serial"
@@ -235,9 +236,8 @@ func expectBindingLine(r *bufio.Reader) (string, error) {
 	return "", fmt.Errorf("BINDING not received")
 }
 
-// parseBindingLine: "fs_uuid=XXXX partuuid=YYYY ptuuid=ZZZZ" → binding key 생성
-// USB 동글의 BuildKeyV1과 동일한 방식: "fs_uuid|partuuid|ptuuid"
-func parseBindingLine(line string) string {
+// parseBindingLine: "fs_uuid=XXXX partuuid=YYYY ptuuid=ZZZZ" → Snapshot 생성
+func parseBindingLine(line string) device.Snapshot {
 	fields := strings.Fields(line)
 	binds := make(map[string]string)
 	for _, f := range fields {
@@ -251,7 +251,11 @@ func parseBindingLine(line string) string {
 	partUUID := strings.ToLower(strings.TrimSpace(binds["partuuid"]))
 	ptUUID := strings.ToLower(strings.TrimSpace(binds["ptuuid"]))
 
-	return fsUUID + "|" + partUUID + "|" + ptUUID
+	return device.Snapshot{
+		FsUUID:   fsUUID,
+		PartUUID: partUUID,
+		PTUUID:   ptUUID,
+	}
 }
 
 // waitFor: read lines until a wanted line or prefix appears (ignores DBG: lines)
