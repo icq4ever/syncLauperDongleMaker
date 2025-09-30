@@ -73,9 +73,18 @@ func cmdProvision(args []string) {
 	uid = strings.ToUpper(strings.TrimSpace(uid))
 	fmt.Println("UID:", uid)
 
+	// 2.5) GET-BINDING - collect partition binding info
+	writeLine(s, "GET-BINDING")
+	bindingLine, err := expectBindingLine(br)
+	if err != nil {
+		fatal("GET-BINDING: %v", err)
+	}
+	bindingKey := parseBindingLine(bindingLine)
+	fmt.Println("Binding:", bindingKey)
+
 	// 3) license / sig acquire
 	var licBytes []byte
-	var sigB64 []byte
+	var sigBytes []byte
 
 	if strings.TrimSpace(*licensePath) != "" {
 		// file mode
@@ -90,12 +99,15 @@ func cmdProvision(args []string) {
 			if err != nil {
 				fatal("read license.sig: %v", err)
 			}
-			sigB64 = sb
+			// sig 파일이 base64인지 바이너리인지 자동 판별
+			sigBytes, err = decodeSignature(sb)
+			if err != nil {
+				fatal("decode signature: %v", err)
+			}
 		} else {
 			// sign with provPriv
 			privProv := mustLoadPriv(*provPriv)
-			sig := ed25519.Sign(privProv, licBytes)
-			sigB64 = []byte(base64.StdEncoding.EncodeToString(sig))
+			sigBytes = ed25519.Sign(privProv, licBytes)
 		}
 	} else {
 		// interactive issue
@@ -116,15 +128,15 @@ func cmdProvision(args []string) {
 				fmt.Println("  (required)")
 			}
 		}
-		issued := time.Now().UTC().Format(time.RFC3339)
-		serial := sha256Hex(uid + "|" + issued)
+		issued := time.Now().UTC()
+		serial := sha256Hex(bindingKey + "|" + issued.Format(time.RFC3339))
 
 		lic := struct {
-			Version     int    `json:"version"`
-			Licensee    string `json:"licensee"`
-			LicensePlan string `json:"license_plan"`
-			IssuedAt    string `json:"issued_at"`
-			SerialKey   string `json:"serial_key"`
+			Version     int       `json:"version"`
+			Licensee    string    `json:"licensee"`
+			LicensePlan string    `json:"license_plan"`
+			IssuedAt    time.Time `json:"issued_at"`
+			SerialKey   string    `json:"serial_key"`
 		}{
 			Version:     2,
 			Licensee:    lc,
@@ -140,8 +152,7 @@ func cmdProvision(args []string) {
 
 		// sign with provPriv
 		privProv := mustLoadPriv(*provPriv)
-		sig := ed25519.Sign(privProv, licBytes)
-		sigB64 = []byte(base64.StdEncoding.EncodeToString(sig))
+		sigBytes = ed25519.Sign(privProv, licBytes)
 
 		// summary & confirm
 		fmt.Println("\nSummary:")
@@ -149,7 +160,7 @@ func cmdProvision(args []string) {
 		fmt.Printf("  plan       : %s\n", *plan)
 		fmt.Printf("  port       : %s\n", p)
 		fmt.Printf("  UID        : %s\n", uid)
-		printIssuedUTCandKST("issued_at", parseRFC3339Z(issued))
+		printIssuedUTCandKST("issued_at", issued)
 		fmt.Printf("  serial_key : %s\n", serial)
 		if !*yes {
 			fmt.Print("\nProceed? (y/N): ")
@@ -246,11 +257,11 @@ func cmdProvision(args []string) {
 		fatal("after license: %v", err)
 	}
 
-	writeLine(s, fmt.Sprintf("PUT license.sig %d", len(sigB64)))
+	writeLine(s, fmt.Sprintf("PUT license.sig %d", len(sigBytes)))
 	if err := expectReady(br); err != nil {
 		fatal("PUT license.sig: %v", err)
 	}
-	if err := writeExact(s, sigB64); err != nil {
+	if err := writeExact(s, sigBytes); err != nil {
 		fatal("write sig: %v", err)
 	}
 	if err := expectWrote(br); err != nil {
@@ -266,7 +277,7 @@ func cmdProvision(args []string) {
 	_ = os.MkdirAll("out", 0755)
 	tag := time.Now().Format("20060102T150405")
 	_ = os.WriteFile(filepath.Join("out", "license-"+tag+".json"), licBytes, 0644)
-	_ = os.WriteFile(filepath.Join("out", "license-"+tag+".sig"), sigB64, 0644)
+	_ = os.WriteFile(filepath.Join("out", "license-"+tag+".sig"), sigBytes, 0644)
 
 	fmt.Println("\nprovision: DONE")
 }

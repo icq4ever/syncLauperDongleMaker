@@ -2,6 +2,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -49,10 +50,19 @@ func cmdDongleVerify() {
 	// 2) license 파일 로드
 	licBytes, sigBytes := readLicensePair(*mount, partDev)
 
+	// 2.5) 서명 디코딩 (바이너리 또는 base64 자동 판별)
+	// 현재는 바이너리 64바이트를 표준으로 사용 (USB 동글과 통일)
+	// 하지만 이전 base64 형식도 호환성을 위해 지원
+	sigDecoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(sigBytes)))
+	if err != nil || len(sigDecoded) != 64 {
+		// base64 디코딩 실패 또는 길이 불일치 시 원본 바이너리 사용
+		sigDecoded = sigBytes
+	}
+
 	// 3) 서명 검증
 	pub, err := keys.LoadEd25519PubFromPEM(*pubPath)
 	must(err)
-	if !keys.VerifyEd25519(pub, licBytes, sigBytes) {
+	if !keys.VerifyEd25519(pub, licBytes, sigDecoded) {
 		// Verify 실패는 명확하게 코드 10으로 나눔
 		fmt.Println("signature: BAD")
 		os.Exit(10)

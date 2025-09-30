@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	crand "crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -38,6 +39,25 @@ func mustLoadPriv(path string) ed25519.PrivateKey {
 func sha256Hex(s string) string {
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])
+}
+
+// decodeSignature: 서명 파일이 base64인지 바이너리인지 자동 판별하여 디코딩
+// Ed25519 서명은 64바이트여야 함
+func decodeSignature(data []byte) ([]byte, error) {
+	// 이미 64바이트 바이너리면 그대로 반환
+	if len(data) == 64 {
+		return data, nil
+	}
+
+	// base64 디코딩 시도
+	trimmed := strings.TrimSpace(string(data))
+	decoded, err := base64.StdEncoding.DecodeString(trimmed)
+	if err == nil && len(decoded) == 64 {
+		return decoded, nil
+	}
+
+	// 둘 다 실패하면 에러
+	return nil, fmt.Errorf("invalid signature format (expected 64 bytes or base64, got %d bytes)", len(data))
 }
 
 func randomNonceHex(nBytes int) string {
@@ -182,6 +202,56 @@ func expectUIDLine(r *bufio.Reader) (string, error) {
 		return l, nil
 	}
 	return "", fmt.Errorf("UID not received")
+}
+
+// expectBindingLine: GET-BINDING 후 나오는 BINDING 라인을 읽음
+// 예상 포맷: "BINDING fs_uuid=XXXX partuuid=YYYY ptuuid=ZZZZ"
+func expectBindingLine(r *bufio.Reader) (string, error) {
+	for i := 0; i < 8; i++ {
+		l := strings.TrimSpace(readLineWithDuration(r, 2*time.Second))
+		if l == "" {
+			continue
+		}
+		if strings.HasPrefix(l, "DBG:") {
+			fmt.Println("[DEV]", l)
+			// DBG 라인에 BINDING이 있는 경우도 처리
+			if idx := strings.Index(l, "BINDING"); idx >= 0 {
+				rest := strings.TrimSpace(l[idx+7:])
+				if rest != "" {
+					return rest, nil
+				}
+			}
+			continue
+		}
+		// "BINDING ..." 형태 또는 key=value 형태 둘 다 받음
+		if strings.HasPrefix(l, "BINDING ") {
+			return strings.TrimSpace(l[8:]), nil
+		}
+		// 그냥 key=value 나열인 경우도 받음
+		if strings.Contains(l, "=") {
+			return l, nil
+		}
+	}
+	return "", fmt.Errorf("BINDING not received")
+}
+
+// parseBindingLine: "fs_uuid=XXXX partuuid=YYYY ptuuid=ZZZZ" → binding key 생성
+// USB 동글의 BuildKeyV1과 동일한 방식: "fs_uuid|partuuid|ptuuid"
+func parseBindingLine(line string) string {
+	fields := strings.Fields(line)
+	binds := make(map[string]string)
+	for _, f := range fields {
+		parts := strings.SplitN(f, "=", 2)
+		if len(parts) == 2 {
+			binds[parts[0]] = parts[1]
+		}
+	}
+	// USB 동글과 동일한 키 순서
+	fsUUID := strings.ToUpper(strings.TrimSpace(binds["fs_uuid"]))
+	partUUID := strings.ToLower(strings.TrimSpace(binds["partuuid"]))
+	ptUUID := strings.ToLower(strings.TrimSpace(binds["ptuuid"]))
+
+	return fsUUID + "|" + partUUID + "|" + ptUUID
 }
 
 // waitFor: read lines until a wanted line or prefix appears (ignores DBG: lines)
